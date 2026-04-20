@@ -1,0 +1,171 @@
+name: archon-pr-maintenance
+description: |
+  Use when: A single open PR needs rebasing, conflict resolution, or CI fixing.
+  Triggers: "fix stale PRs", "maintain PRs", "rebase open PRs", "merge open PRs",
+            "clean up PRs", "PR maintenance", "fix PR #123".
+  NOT for: Creating new PRs, reviewing code, fixing specific issues from scratch.
+
+  Picks the highest-priority open PR needing attention (or a specific PR if given),
+  rebases it, resolves conflicts, fixes CI failures, and enables auto-merge.
+  Designed to be run on a cron — one PR per run, zero AI cost if nothing to do.
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FIND THE NEXT PR TO FIX (bash only — zero AI cost)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: find-pr
+    bash: |
+      # If a specific PR number was passed, use that
+      REQUESTED=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+
+      if [ -n "$REQUESTED" ]; then
+        # Validate the PR exists and is open
+        STATE=$(gh pr view "$REQUESTED" --json state -q '.state' 2>/dev/null)
+        if [ "$STATE" = "OPEN" ]; then
+          echo "$REQUESTED"
+          exit 0
+        else
+          echo "PR #$REQUESTED is not open (state: $STATE)" >&2
+          exit 1
+        fi
+      fi
+
+      # No specific PR requested — find the highest priority actionable one.
+      # Priority: BEHIND (just needs rebase) > DIRTY (conflicts) > UNSTABLE (CI failing)
+      # Skip CLEAN (handled by wrapper script) and BLOCKED (can't do anything).
+      for STATUS in BEHIND DIRTY UNSTABLE UNKNOWN; do
+        PR=$(gh pr list --state open --json number,mergeStateStatus,isDraft \
+          --jq "[.[] | select(.isDraft == false and .mergeStateStatus == \"$STATUS\")] | .[0].number // empty")
+        if [ -n "$PR" ]; then
+          echo "$PR"
+          exit 0
+        fi
+      done
+
+      echo "No PRs need maintenance" >&2
+      exit 1
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: CHECKOUT & DIAGNOSE (bash only — zero AI cost)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: checkout-and-diagnose
+    bash: |
+      PR_NUMBER="$find-pr.output"
+
+      # Checkout the PR branch
+      gh pr checkout "$PR_NUMBER"
+
+      # Gather diagnostic info
+      echo "=== PR INFO ==="
+      gh pr view "$PR_NUMBER" --json number,title,headRefName,baseRefName,mergeable,mergeStateStatus,statusCheckRollup \
+        --jq '{number, title, head: .headRefName, base: .baseRefName, mergeable, mergeState: .mergeStateStatus, checks: [.statusCheckRollup[]? | {name, status, conclusion}]}'
+
+      echo ""
+      echo "=== BEHIND COUNT ==="
+      BASE=$(gh pr view "$PR_NUMBER" --json baseRefName -q '.baseRefName')
+      git fetch origin "$BASE" --quiet
+      BEHIND=$(git rev-list --count HEAD.."origin/$BASE")
+      echo "$BEHIND commits behind $BASE"
+
+      echo ""
+      echo "=== FILES CHANGED ==="
+      gh pr diff "$PR_NUMBER" --name-only 2>/dev/null | head -30
+    depends_on: [find-pr]
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: FIX THE PR (AI — only runs if phases 1-2 succeeded)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fix-pr
+    prompt: |
+      You are a PR maintenance agent. Fix this single PR so it can merge.
+
+      ## PR Diagnostics
+
+      ```
+      $checkout-and-diagnose.output
+      ```
+
+      ## Instructions
+
+      You are already on the PR's branch. Follow these steps:
+
+      ### Step 1: Rebase onto base branch
+
+      ```bash
+      BASE=$(gh pr view $find-pr.output --json baseRefName -q '.baseRefName')
+      git rebase "origin/$BASE"
+      ```
+
+      If conflicts arise:
+      - Check conflicting files: `git diff --name-only --diff-filter=U`
+      - For each file, read the full file to understand the conflict markers
+      - Resolve based on intent:
+        - Both sides added different things → keep both
+        - One side updated, other didn't → keep the update
+        - Both changed same lines → understand the PR's intent from the title/diff and resolve accordingly
+      - Stage each resolved file: `git add <file>`
+      - Continue: `git rebase --continue`
+      - If the rebase has more than 5 conflicting files, abort (`git rebase --abort`) and report failure
+
+      ### Step 2: Validate
+
+      Run the project's validation. Check for these in order and run the first that exists:
+      ```bash
+      # Check what package manager / validation commands exist
+      if [ -f "pubspec.yaml" ]; then
+        flutter analyze && flutter test
+      elif [ -f "bun.lockb" ] || [ -f "bunfig.toml" ]; then
+        bun run type-check 2>/dev/null; bun test 2>/dev/null
+      elif [ -f "package.json" ]; then
+        npm test 2>/dev/null
+      elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+        python -m pytest 2>/dev/null
+      elif [ -f "go.mod" ]; then
+        go test ./... 2>/dev/null
+      fi
+      ```
+
+      If validation fails, fix the issue and re-run. If you can't fix it after one attempt,
+      proceed anyway — CI will catch it.
+
+      ### Step 3: Push
+
+      ```bash
+      git push --force-with-lease
+      ```
+
+      ### Step 4: Enable auto-merge
+
+      ```bash
+      gh pr merge $find-pr.output --squash --auto --delete-branch 2>&1 || \
+        echo "Auto-merge not available"
+      ```
+
+      If auto-merge is not available (no branch protection rules), check CI status
+      and merge directly once passing:
+      ```bash
+      gh pr checks $find-pr.output --watch --fail-fast 2>&1 || true
+      gh pr merge $find-pr.output --squash --delete-branch 2>&1 || \
+        echo "Could not merge — may need manual review"
+      ```
+
+      ### Step 5: Report result
+
+      Output a brief summary: PR number, what you did, whether it merged or has auto-merge enabled.
+
+      ## Important
+
+      - Be concise. Fix the problem, don't explain it at length.
+      - Only fix what's needed for the PR to merge — don't refactor or improve unrelated code.
+      - If a CI failure is environmental (flaky test, infra issue), push an empty commit to retry.
+    depends_on: [checkout-and-diagnose]
+    context: fresh
+    model: sonnet
