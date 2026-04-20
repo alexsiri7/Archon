@@ -1,0 +1,357 @@
+name: archon-test-audit
+description: |
+  Use when: User wants to improve test coverage, fix flaky tests, or audit test quality.
+  Triggers: "test audit", "improve coverage", "fix flaky tests", "test coverage",
+            "add tests", "test quality", "stability audit", "robustness".
+  Does: Measures current coverage -> identifies critical gaps -> fixes flaky tests ->
+        writes new tests for uncovered code -> validates -> creates PR.
+  NOT for: Writing tests for a specific feature (use archon-fix-github-issue),
+           PR-scoped test review (that's the test-coverage-agent in review workflows).
+
+provider: claude
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: MEASURE CURRENT STATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: measure-coverage
+    bash: |
+      echo "=== PROJECT DETECTION ==="
+      # Detect project type
+      HAS_PYTHON=false
+      HAS_NODE=false
+      [ -f "requirements.txt" ] || [ -f "backend/requirements.txt" ] || [ -f "pyproject.toml" ] && HAS_PYTHON=true
+      [ -f "package.json" ] || [ -f "frontend/package.json" ] && HAS_NODE=true
+      echo "Python: $HAS_PYTHON"
+      echo "Node: $HAS_NODE"
+
+      echo ""
+      echo "=== PYTHON COVERAGE ==="
+      if [ "$HAS_PYTHON" = "true" ]; then
+        pip install pytest-cov 2>/dev/null || true
+        # Try common pytest locations
+        if [ -f "backend/requirements.txt" ]; then
+          python -m pytest backend/tests/ --cov=backend --cov-report=term-missing --tb=no -q 2>&1 || echo "pytest failed"
+        elif [ -f "pyproject.toml" ]; then
+          python -m pytest --cov=. --cov-report=term-missing --tb=no -q 2>&1 || echo "pytest failed"
+        else
+          python -m pytest --cov=. --cov-report=term-missing --tb=no -q 2>&1 || echo "pytest failed"
+        fi
+      else
+        echo "No Python project detected"
+      fi
+
+      echo ""
+      echo "=== NODE COVERAGE ==="
+      if [ "$HAS_NODE" = "true" ]; then
+        # Try running coverage from root or frontend
+        if [ -f "package.json" ]; then
+          npx vitest run --coverage --reporter=verbose 2>&1 | tail -60 || \
+          npm test -- --coverage 2>&1 | tail -60 || \
+          echo "Node tests failed at root"
+        fi
+        if [ -f "frontend/package.json" ]; then
+          echo "--- Frontend coverage ---"
+          cd frontend
+          npx vitest run --coverage --reporter=verbose 2>&1 | tail -60 || \
+          npm test -- --coverage 2>&1 | tail -60 || \
+          echo "Frontend tests failed"
+          cd ..
+        fi
+      else
+        echo "No Node project detected"
+      fi
+
+      echo ""
+      echo "=== TEST FILE INVENTORY ==="
+      echo "Python test files:"
+      find . -name 'test_*.py' -o -name '*_test.py' | grep -v node_modules | grep -v .git | sort
+      echo ""
+      echo "JS/TS test files:"
+      find . -name '*.test.*' -o -name '*.spec.*' | grep -v node_modules | grep -v .git | sort
+
+      echo ""
+      echo "=== SOURCE FILES WITHOUT TESTS ==="
+      echo "Python source files without corresponding tests:"
+      for f in $(find . -name '*.py' -not -name 'test_*' -not -name '*_test.py' -not -name '__init__.py' -not -path '*/tests/*' -not -path '*/migrations/*' -not -path '*/.git/*' -not -path '*/node_modules/*' | sort); do
+        base=$(basename "$f" .py)
+        if ! find . -name "test_${base}.py" -o -name "${base}_test.py" 2>/dev/null | grep -q .; then
+          echo "  UNTESTED: $f"
+        fi
+      done
+
+      echo ""
+      echo "JS/TS source files without corresponding tests:"
+      for f in $(find . -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' | grep -v node_modules | grep -v .git | grep -v dist | grep -v '.test.' | grep -v '.spec.' | grep -v '__tests__' | sort); do
+        base=$(basename "$f" | sed 's/\.\(ts\|tsx\|js\|jsx\)$//')
+        if ! find . -name "${base}.test.*" -o -name "${base}.spec.*" 2>/dev/null | grep -v node_modules | grep -q .; then
+          echo "  UNTESTED: $f"
+        fi
+      done
+
+      echo ""
+      echo "=== FLAKY TEST INDICATORS ==="
+      echo "Skipped tests:"
+      grep -rn '@pytest.mark.skip\|pytest.skip\|@skip\|xit(\|xdescribe(\|test.todo\|test.skip\|\.skip(' \
+        --include='*.py' --include='*.ts' --include='*.js' --include='*.tsx' --include='*.jsx' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist . 2>/dev/null | head -20
+
+      echo ""
+      echo "Retry/flaky patterns:"
+      grep -rn 'flaky\|retry\|eventually\|wait_for\|sleep.*assert\|xfail' \
+        --include='*.py' --include='*.ts' --include='*.js' --include='*.tsx' --include='*.jsx' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist . 2>/dev/null | head -20
+    timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: ANALYZE GAPS (parallel agents)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: coverage-gap-agent
+    prompt: |
+      You are a test coverage specialist. Analyze the coverage report and identify the most critical gaps.
+
+      ## Coverage Data
+      $measure-coverage.output
+
+      ## Focus: $ARGUMENTS
+
+      ## Instructions
+
+      1. Read the coverage report — identify files/functions with lowest coverage
+      2. For each untested source file, read it and assess criticality:
+         - Business logic (payment, auth, core algorithms) = CRITICAL
+         - API endpoints handling user input = HIGH
+         - Data transformations, validators = MEDIUM
+         - Utilities, formatters, config = LOW
+      3. For files with partial coverage, read them and identify which branches/paths are untested
+      4. Prioritize: what would catch the most bugs if tested?
+
+      ## Output
+
+      Write to $ARTIFACTS_DIR/coverage-gaps.md:
+      - Total coverage percentage (if available)
+      - Top 10 most critical untested code paths, ordered by risk
+      - For each: file, function/method, why it's critical, what test to write
+      - Estimated number of tests needed to reach next coverage milestone
+    depends_on: [measure-coverage]
+    context: fresh
+    model: sonnet
+    denied_tools: [Write, Edit, Bash]
+
+  - id: flaky-test-agent
+    prompt: |
+      You are a test stability specialist. Find and diagnose flaky, slow, or unreliable tests.
+
+      ## Test Data
+      $measure-coverage.output
+
+      ## Instructions
+
+      1. Read every skipped/xfail test and determine: is it actually broken, or just neglected?
+      2. Look for common flaky patterns:
+         - Time-dependent tests (sleep, wall clock, timeouts)
+         - Order-dependent tests (shared state, missing teardown)
+         - Network-dependent tests (external APIs without mocking)
+         - Race conditions (async without proper awaiting)
+         - Hardcoded paths or ports
+      3. Read the test files and identify tests that are:
+         - Slow (>5s) — check for unnecessary sleeps, full DB rebuilds
+         - Brittle — testing implementation details instead of behavior
+         - Missing assertions — tests that always pass
+
+      ## Output
+
+      Write to $ARTIFACTS_DIR/flaky-tests.md:
+      - List of skipped tests with recommendation: fix, delete, or keep skipped
+      - List of flaky patterns found with specific file:line references
+      - List of slow tests with optimization suggestions
+      - List of tests with weak/missing assertions
+    depends_on: [measure-coverage]
+    context: fresh
+    model: sonnet
+    denied_tools: [Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: PLAN
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: plan
+    prompt: |
+      You are planning test improvements. Synthesize the coverage analysis and flaky test findings.
+
+      ## Coverage Gaps
+      $coverage-gap-agent.output
+
+      ## Flaky Tests
+      $flaky-test-agent.output
+
+      ## Principles
+
+      - Fix flaky tests FIRST — unreliable tests are worse than no tests
+      - Delete tests that can never pass or test nothing
+      - Write tests for critical business logic before edge cases
+      - Each new test must test BEHAVIOR, not implementation
+      - Don't mock what you don't own — use fakes/fixtures for external dependencies
+      - Keep tests fast — mock/stub slow dependencies (network, disk)
+      - Max scope: 15 test changes per PR to keep reviews manageable
+
+      ## Instructions
+
+      1. From both reports, select up to 15 highest-impact improvements:
+         - Fix/delete flaky tests (up to 5)
+         - Write new tests for critical gaps (up to 10)
+      2. For each: specify file, what to test, expected assertions, any fixtures needed
+      3. Order by: flaky fixes first, then critical coverage gaps, then medium gaps
+
+      ## Output
+
+      Numbered plan. Be specific — the implement node will follow this literally.
+    depends_on: [coverage-gap-agent, flaky-test-agent]
+    context: fresh
+    allowed_tools: [Read]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: IMPLEMENT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    prompt: |
+      You are implementing test improvements.
+
+      ## Plan
+      $plan.output
+
+      ## Rules
+
+      - Follow the plan exactly — do not add extra tests beyond the plan
+      - Each test must have clear arrange/act/assert structure
+      - Use the project's existing test patterns and fixtures — read existing tests first
+      - Every test must have a descriptive name that explains what behavior it verifies
+      - After writing each test, run it individually to verify it passes
+      - If a test requires new fixtures or mocks, create them in the appropriate conftest/setup file
+      - Commit each logical group of tests separately
+
+      ## Instructions
+
+      1. Read existing test files to understand patterns, fixtures, and conventions
+      2. Work through the plan items in order
+      3. For flaky test fixes: read the test, diagnose, fix, verify it's stable
+      4. For new tests: write, run, verify passing
+      5. After all changes, run the full test suite to ensure nothing regressed
+    depends_on: [plan]
+    context: fresh
+    hooks:
+      PostToolUse:
+        - matcher: "Write|Edit"
+          response:
+            systemMessage: >
+              You just modified a test file. Run the specific test NOW to verify it passes.
+              Do not batch — verify each test immediately after writing it.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    bash: |
+      echo "=== RUNNING FULL TEST SUITE ==="
+      PASS=true
+
+      if [ -f "backend/requirements.txt" ] || [ -f "pyproject.toml" ]; then
+        echo "--- Python tests ---"
+        if ! python -m pytest -v 2>&1; then
+          PASS=false
+        fi
+      fi
+
+      if [ -f "package.json" ]; then
+        echo "--- Root JS/TS tests ---"
+        if ! npx vitest run 2>&1 && ! npm test 2>&1; then
+          PASS=false
+        fi
+      fi
+
+      if [ -f "frontend/package.json" ]; then
+        echo "--- Frontend tests ---"
+        cd frontend
+        if ! npx vitest run 2>&1 && ! npm test 2>&1; then
+          PASS=false
+        fi
+        cd ..
+      fi
+
+      if [ "$PASS" = "true" ]; then
+        echo "VALIDATION_STATUS: PASS"
+      else
+        echo "VALIDATION_STATUS: FAIL"
+      fi
+    depends_on: [implement]
+    timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: FIX FAILURES
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fix-failures
+    prompt: |
+      Review the validation output below.
+
+      ## Validation Output
+      $validate.output
+
+      ## Instructions
+
+      If "VALIDATION_STATUS: PASS", respond with "All tests pass" and stop.
+
+      If there are failures:
+      1. Read the failing test output carefully
+      2. Fix ONLY the failing tests — do not modify passing tests
+      3. If a new test is fundamentally wrong (bad assumption), delete it rather than forcing it to pass
+      4. Run the failing test after each fix to verify
+      5. After all fixes, run the full test suite
+    depends_on: [validate]
+    context: fresh
+    model: haiku
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: CREATE PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a PR for the test improvements.
+
+      ## Context
+      - Coverage gaps: $coverage-gap-agent.output
+      - Flaky tests: $flaky-test-agent.output
+      - Plan: $plan.output
+      - Validation: $validate.output
+
+      ## Instructions
+
+      1. Check `git diff --stat` — if no changes, skip PR creation
+      2. Stage and commit all changes if uncommitted
+      3. Push: `git push -u origin HEAD`
+      4. Create PR:
+         - Title: "test: improve coverage and fix flaky tests"
+         - Body: summary of what was added/fixed, coverage before/after if available
+      5. Save PR number: `echo "$(gh pr view --json number -q '.number')" > $ARTIFACTS_DIR/.pr-number`
+      6. Mark ready and auto-merge:
+         ```bash
+         PR_NUM=$(cat $ARTIFACTS_DIR/.pr-number)
+         gh pr ready "$PR_NUM"
+         gh pr merge "$PR_NUM" --squash --auto --delete-branch
+         ```
+    depends_on: [fix-failures]
+    context: fresh
+    model: haiku
+    hooks:
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              permissionDecision: deny
+              permissionDecisionReason: "PR creation node — do not modify source files."
