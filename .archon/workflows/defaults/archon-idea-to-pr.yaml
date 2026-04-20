@@ -134,3 +134,18 @@ nodes:
     command: archon-workflow-summary
     depends_on: [implement-fixes]
     context: fresh
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PHASE 9: AUTO-MERGE
+  # ═══════════════════════════════════════════════════════════════════
+
+  - id: auto-merge
+    bash: |
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null || echo "")
+      if [ -z "$PR_NUMBER" ]; then
+        echo "No PR number found, skipping auto-merge"
+        exit 0
+      fi
+      gh pr ready "$PR_NUMBER" 2>/dev/null || true
+      gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>&1 || echo "Auto-merge not available, PR left open for manual merge"
+    depends_on: [workflow-summary]

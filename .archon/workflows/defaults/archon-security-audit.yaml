@@ -1,0 +1,388 @@
+name: archon-security-audit
+description: |
+  Use when: User wants a deep security and privacy audit of the codebase.
+  Triggers: "security audit", "privacy audit", "security review", "vulnerability scan",
+            "check for security issues", "owasp review", "pentest the code".
+  Does: Scans attack surface -> 5 parallel specialized security agents -> synthesize findings ->
+        auto-fix critical/high issues -> create PR for fixes, issues for the rest.
+  NOT for: Single-file fixes, feature development, architecture review.
+
+provider: claude
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: ENUMERATE ATTACK SURFACE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scan-surface
+    bash: |
+      echo "=== PROJECT STRUCTURE ==="
+      find . -name '*.py' -o -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' \
+        | grep -v node_modules | grep -v .git | grep -v dist | grep -v __pycache__ | head -100
+
+      echo ""
+      echo "=== API ENDPOINTS ==="
+      # FastAPI/Flask routes
+      grep -rn '@app\.\(get\|post\|put\|delete\|patch\)\|@router\.\(get\|post\|put\|delete\|patch\)\|app\.route' \
+        --include='*.py' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=__pycache__ . 2>/dev/null | head -50
+      # Express/Next.js routes
+      grep -rn 'app\.\(get\|post\|put\|delete\|patch\)\|router\.\(get\|post\|put\|delete\|patch\)\|export.*\(GET\|POST\|PUT\|DELETE\)' \
+        --include='*.ts' --include='*.js' --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist . 2>/dev/null | head -50
+
+      echo ""
+      echo "=== AUTHENTICATION / AUTH ==="
+      grep -rn 'auth\|token\|session\|cookie\|jwt\|oauth\|password\|credential\|api.key\|secret' \
+        --include='*.py' --include='*.ts' --include='*.js' --include='*.tsx' --include='*.jsx' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=__pycache__ \
+        -il . 2>/dev/null | head -30
+
+      echo ""
+      echo "=== DATABASE QUERIES ==="
+      grep -rn 'execute\|raw_sql\|text(\|\.query\|sql\.\|SELECT\|INSERT\|UPDATE\|DELETE.*FROM' \
+        --include='*.py' --include='*.ts' --include='*.js' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=__pycache__ . 2>/dev/null | head -30
+
+      echo ""
+      echo "=== USER INPUT HANDLING ==="
+      grep -rn 'request\.\(form\|args\|json\|body\|query\|params\|files\)\|req\.body\|req\.query\|req\.params\|FormData\|useFormData\|innerHTML\|dangerouslySetInnerHTML' \
+        --include='*.py' --include='*.ts' --include='*.js' --include='*.tsx' --include='*.jsx' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=__pycache__ . 2>/dev/null | head -30
+
+      echo ""
+      echo "=== FILE OPERATIONS ==="
+      grep -rn 'open(\|write\|upload\|multer\|FormData\|multipart\|file_path\|os\.path\|shutil' \
+        --include='*.py' --include='*.ts' --include='*.js' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=__pycache__ . 2>/dev/null | head -20
+
+      echo ""
+      echo "=== ENV / SECRETS ==="
+      grep -rn 'process\.env\|os\.environ\|os\.getenv\|dotenv\|\.env\|SECRET\|API_KEY\|PASSWORD\|TOKEN' \
+        --include='*.py' --include='*.ts' --include='*.js' --include='*.tsx' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=__pycache__ . 2>/dev/null | head -30
+      echo ""
+      echo "=== HARDCODED SECRETS CHECK ==="
+      grep -rn "sk-\|ghp_\|gho_\|glpat-\|xoxb-\|xoxp-\|AKIA\|password.*=.*['\"]" \
+        --include='*.py' --include='*.ts' --include='*.js' --include='*.tsx' --include='*.jsx' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=__pycache__ . 2>/dev/null | head -20
+
+      echo ""
+      echo "=== DEPENDENCIES ==="
+      cat requirements.txt 2>/dev/null || cat backend/requirements.txt 2>/dev/null || true
+      cat package.json 2>/dev/null | grep -A 999 '"dependencies"' | head -40 || true
+
+      echo ""
+      echo "=== CORS / HEADERS ==="
+      grep -rn 'cors\|CORS\|Access-Control\|X-Frame\|Content-Security-Policy\|helmet\|CSP' \
+        --include='*.py' --include='*.ts' --include='*.js' \
+        --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=__pycache__ . 2>/dev/null | head -20
+
+      echo ""
+      echo "=== DOCKER / DEPLOY CONFIG ==="
+      cat Dockerfile 2>/dev/null | head -30 || true
+      cat docker-compose.yml 2>/dev/null | head -30 || true
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: PARALLEL SECURITY ANALYSIS (5 specialized agents)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: injection-agent
+    prompt: |
+      You are a security specialist focused on **injection vulnerabilities**.
+
+      ## Attack Surface
+      $scan-surface.output
+
+      ## Scope
+      Audit the ENTIRE codebase for injection attacks. Read every file that handles user input, database queries, or shell commands.
+
+      ## Checklist
+      - **SQL injection**: raw queries, string interpolation in SQL, ORM misuse, unparameterized queries
+      - **Command injection**: subprocess calls with user input, os.system, exec, eval
+      - **Template injection**: user input in templates, SSTI
+      - **Path traversal**: user-controlled file paths, directory escapes, file uploads without path sanitization
+      - **LDAP/NoSQL injection**: if applicable
+      - **XSS**: reflected, stored, DOM-based — innerHTML, dangerouslySetInnerHTML, unescaped output
+      - **Header injection**: CRLF in headers, host header attacks
+
+      ## Output
+      Write findings to $ARTIFACTS_DIR/injection-findings.md with:
+      - Finding ID (INJ-001, etc.)
+      - Severity: CRITICAL / HIGH / MEDIUM / LOW
+      - File and line number
+      - Description of the vulnerability
+      - Proof: show the vulnerable code
+      - Fix: specific code change needed
+    depends_on: [scan-surface]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  - id: auth-agent
+    prompt: |
+      You are a security specialist focused on **authentication and authorization**.
+
+      ## Attack Surface
+      $scan-surface.output
+
+      ## Scope
+      Audit the ENTIRE codebase for auth vulnerabilities. Read every file related to authentication, sessions, tokens, and access control.
+
+      ## Checklist
+      - **Broken authentication**: weak password policies, no rate limiting on login, credential stuffing
+      - **Session management**: session fixation, insecure cookies (missing Secure/HttpOnly/SameSite), session timeout
+      - **JWT issues**: algorithm confusion, missing expiration, weak signing keys, token in URL
+      - **OAuth issues**: state parameter missing, redirect URI validation, token storage
+      - **Broken access control**: IDOR, missing authorization checks on endpoints, privilege escalation
+      - **CSRF**: missing CSRF tokens on state-changing operations, SameSite cookie config
+      - **API authentication**: missing auth on endpoints, API key exposure, bearer token handling
+
+      ## Output
+      Write findings to $ARTIFACTS_DIR/auth-findings.md — same format as injection agent (AUTH-001, etc.)
+    depends_on: [scan-surface]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  - id: data-privacy-agent
+    prompt: |
+      You are a security specialist focused on **data privacy and exposure**.
+
+      ## Attack Surface
+      $scan-surface.output
+
+      ## Scope
+      Audit the ENTIRE codebase for data privacy issues. Read every file that handles user data, logging, error responses, or external API calls.
+
+      ## Checklist
+      - **Sensitive data exposure**: PII in logs, verbose error messages leaking internals, stack traces in production
+      - **Data at rest**: unencrypted sensitive fields in DB, plaintext passwords, API keys in code
+      - **Data in transit**: HTTP instead of HTTPS, missing TLS, insecure websocket
+      - **Secrets management**: hardcoded secrets, secrets in git history, .env in Docker image, exposed in client bundle
+      - **Third-party data leakage**: sending user data to analytics/CDN without consent, excessive data in API responses
+      - **Logging**: logging passwords, tokens, PII, credit cards
+      - **Error handling**: different error messages revealing valid/invalid usernames, timing attacks
+      - **GDPR/privacy**: data retention, deletion capability, consent mechanisms, right to export
+
+      ## Output
+      Write findings to $ARTIFACTS_DIR/privacy-findings.md — same format (PRIV-001, etc.)
+    depends_on: [scan-surface]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  - id: config-deps-agent
+    prompt: |
+      You are a security specialist focused on **configuration and dependency security**.
+
+      ## Attack Surface
+      $scan-surface.output
+
+      ## Scope
+      Audit the ENTIRE codebase for configuration and dependency issues. Read all config files, Dockerfiles, CI configs, and dependency manifests.
+
+      ## Checklist
+      - **Security headers**: missing HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
+      - **CORS misconfiguration**: wildcard origins, credentials with wildcard, overly permissive
+      - **Docker security**: running as root, unnecessary capabilities, secrets in build layers, outdated base images
+      - **Dependency vulnerabilities**: check versions against known CVEs, outdated packages with known issues
+      - **CI/CD security**: secrets in logs, permissive permissions, unsigned artifacts
+      - **Debug/dev in production**: debug mode enabled, development credentials, verbose logging
+      - **TLS/SSL**: weak cipher suites, self-signed certs, missing certificate validation
+      - **Rate limiting**: missing rate limits on auth endpoints, API abuse protection
+
+      ## Output
+      Write findings to $ARTIFACTS_DIR/config-findings.md — same format (CFG-001, etc.)
+    depends_on: [scan-surface]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  - id: logic-agent
+    prompt: |
+      You are a security specialist focused on **business logic and application security**.
+
+      ## Attack Surface
+      $scan-surface.output
+
+      ## Scope
+      Audit the ENTIRE codebase for business logic vulnerabilities. Read the core application logic, state machines, payment flows, and user-facing operations.
+
+      ## Checklist
+      - **Race conditions**: TOCTOU, double-submit, concurrent modification without locks
+      - **Business logic bypass**: skipping steps in multi-step flows, parameter tampering, mass assignment
+      - **Insecure direct object references**: predictable IDs, missing ownership checks
+      - **File upload**: unrestricted file types, missing size limits, path traversal in filenames, executable uploads
+      - **Denial of service**: regex DoS (ReDoS), unbounded queries, missing pagination, resource exhaustion
+      - **Integer overflow/underflow**: in financial calculations, ratings, scores
+      - **Insecure randomness**: using Math.random or random for security-sensitive operations
+      - **Open redirects**: unvalidated redirect URLs
+
+      ## Output
+      Write findings to $ARTIFACTS_DIR/logic-findings.md — same format (LOGIC-001, etc.)
+    depends_on: [scan-surface]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: SYNTHESIZE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    prompt: |
+      You are the lead security auditor. Synthesize all findings from the parallel security agents.
+
+      ## Findings
+
+      ### Injection Analysis
+      $injection-agent.output
+
+      ### Authentication & Authorization
+      $auth-agent.output
+
+      ### Data Privacy
+      $data-privacy-agent.output
+
+      ### Configuration & Dependencies
+      $config-deps-agent.output
+
+      ### Business Logic
+      $logic-agent.output
+
+      ## Instructions
+
+      1. Deduplicate findings across agents (same issue found by multiple agents)
+      2. Validate findings — check if the agent's assessment is accurate by reading the actual code
+      3. Assign final severity: CRITICAL / HIGH / MEDIUM / LOW / FALSE_POSITIVE
+      4. Categorize: FIXABLE_NOW (can be fixed in code) vs NEEDS_DISCUSSION (architectural, needs human input)
+      5. Prioritize by: severity × exploitability × data impact
+
+      ## Output
+
+      Write to $ARTIFACTS_DIR/security-report.md:
+
+      ### Executive Summary
+      - Total findings by severity
+      - Overall security posture assessment
+      - Top 3 most urgent issues
+
+      ### CRITICAL & HIGH Findings (to fix now)
+      For each: ID, title, severity, file:line, description, fix
+
+      ### MEDIUM & LOW Findings (to track as issues)
+      For each: ID, title, severity, file:line, description
+
+      ### False Positives (dismissed)
+      For each: ID, why it was dismissed
+
+      Also write $ARTIFACTS_DIR/fix-plan.md with specific code changes for all CRITICAL and HIGH findings, ordered by dependency.
+    depends_on: [injection-agent, auth-agent, data-privacy-agent, config-deps-agent, logic-agent]
+    trigger_rule: one_success
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: FIX CRITICAL & HIGH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fix-security
+    prompt: |
+      You are implementing security fixes for CRITICAL and HIGH severity findings.
+
+      ## Fix Plan
+      $synthesize.output
+
+      Read $ARTIFACTS_DIR/fix-plan.md for the ordered list of fixes.
+
+      ## Rules
+      - Fix ONLY CRITICAL and HIGH severity issues
+      - Each fix must be minimal — do not refactor surrounding code
+      - After each fix, verify the vulnerability is actually resolved
+      - If a fix would break functionality, skip it and note why
+      - Commit each logical fix separately with a descriptive message
+
+      ## Instructions
+      1. Read the fix plan
+      2. For each fix: read the vulnerable code, apply the fix, verify it works
+      3. Run tests after all fixes to ensure nothing is broken
+      4. Do a final `git diff --stat` to verify scope
+    depends_on: [synthesize]
+    context: fresh
+    model: sonnet
+    hooks:
+      PostToolUse:
+        - matcher: "Write|Edit"
+          response:
+            systemMessage: >
+              You just applied a security fix. Verify NOW:
+              1. Is the vulnerability actually fixed? Re-read the code.
+              2. Did you introduce any new issues?
+              3. Run relevant tests to confirm nothing broke.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    bash: |
+      echo "=== RUNNING PROJECT TESTS ==="
+      # Try common test runners
+      if [ -f "pyproject.toml" ] || [ -f "backend/requirements.txt" ]; then
+        echo "--- Python tests ---"
+        python -m pytest 2>&1 || pytest 2>&1 || echo "No pytest found"
+      fi
+      if [ -f "package.json" ]; then
+        echo "--- JS/TS tests ---"
+        npm test 2>&1 || bun run test 2>&1 || echo "No JS tests found"
+      fi
+      if [ -f "frontend/package.json" ]; then
+        echo "--- Frontend tests ---"
+        cd frontend && npm test 2>&1 || bun run test 2>&1; cd ..
+      fi
+      echo "VALIDATION_COMPLETE"
+    depends_on: [fix-security]
+    timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE PR + ISSUES
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a PR for the security fixes and GitHub issues for remaining findings.
+
+      ## Context
+      - Security report: $synthesize.output
+      - Validation: $validate.output
+
+      ## Instructions
+
+      ### Step 1: Create PR for fixes (if any changes were made)
+      1. Check `git diff --stat` — if no changes, skip PR creation
+      2. Stage and commit all changes if uncommitted
+      3. Push: `git push -u origin HEAD`
+      4. Create PR:
+         - Title: "security: fix [N] critical/high vulnerabilities"
+         - Body: list each fix with the finding ID, what was vulnerable, what was changed
+         - Include the executive summary from the security report
+      5. Save PR number: `echo "$(gh pr view --json number -q '.number')" > $ARTIFACTS_DIR/.pr-number`
+      6. Mark ready and enable auto-merge:
+         ```bash
+         PR_NUM=$(cat $ARTIFACTS_DIR/.pr-number)
+         gh pr ready "$PR_NUM"
+         gh pr merge "$PR_NUM" --squash --auto --delete-branch
+         ```
+
+      ### Step 2: Create issues for MEDIUM/LOW findings
+      Read $ARTIFACTS_DIR/security-report.md. For each MEDIUM or LOW finding that was NOT fixed:
+      - Create a GitHub issue with label "security"
+      - Title: "[Security] FINDING_ID: brief description"
+      - Body: severity, file:line, description, suggested fix
+
+      Do NOT create issues for findings marked as FALSE_POSITIVE.
+    depends_on: [validate]
+    context: fresh
+    model: haiku
+    hooks:
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              permissionDecision: deny
+              permissionDecisionReason: "PR creation node — do not modify source files."

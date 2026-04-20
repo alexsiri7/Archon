@@ -18,6 +18,7 @@ model: sonnet
 nodes:
   # ─── Phase 1: Planning ───────────────────────────────────────────────
   - id: plan
+    model: opus
     prompt: |
       You are a product planning expert. Your job is to take a short user prompt and expand it
       into a comprehensive product specification.

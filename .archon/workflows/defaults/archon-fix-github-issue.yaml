@@ -26,6 +26,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: extract-issue-number
+    model: haiku
     prompt: |
       Find the GitHub issue number for this request.
 
@@ -149,6 +150,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: create-pr
+    model: haiku
     prompt: |
       Create a draft pull request for the current branch.
 
@@ -308,3 +310,81 @@ nodes:
     command: archon-issue-completion-report
     depends_on: [simplify]
     context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 11: MARK PR READY & TRIGGER CI
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: prepare-merge
+    bash: |
+      PR_NUMBER=$(cat "$ARTIFACTS_DIR/.pr-number" 2>/dev/null || echo "")
+      if [ -z "$PR_NUMBER" ]; then
+        echo "No PR number found, skipping auto-merge"
+        exit 0
+      fi
+      # Mark PR as ready for review (remove draft status)
+      gh pr ready "$PR_NUMBER" 2>/dev/null || true
+      # Push an empty commit to re-trigger CI on the final state.
+      # Prior steps (simplify, self-fix) may have pushed after the last CI run,
+      # leaving required status checks missing on HEAD.
+      git commit --allow-empty -m "ci: re-trigger checks for auto-merge"
+      git push
+      # Enable auto-merge early — GitHub will merge once CI passes.
+      # This way, if the watch-and-merge loop exits (max iterations),
+      # the PR still merges automatically when CI eventually goes green.
+      gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>&1 || echo "Auto-merge not available, will retry in watch loop"
+      echo "$PR_NUMBER"
+    depends_on: [report]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 12: WATCH CI, FIX FAILURES, AUTO-MERGE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: watch-and-merge
+    depends_on: [prepare-merge]
+    context: fresh
+    model: haiku
+    loop:
+      prompt: |
+        You are watching CI for a pull request. Auto-merge is already enabled —
+        GitHub will merge automatically once CI passes. Your job is to fix CI
+        failures so that auto-merge can proceed.
+
+        ## Setup
+
+        1. Read the PR number from `$ARTIFACTS_DIR/.pr-number`
+        2. If empty, output CI_DONE immediately.
+
+        ## Check CI Status
+
+        Run: `gh pr checks $(cat $ARTIFACTS_DIR/.pr-number) --watch --fail-fast 2>&1 || true`
+
+        This blocks until all checks complete. Then check the exit code / output.
+
+        ## If ALL checks passed
+
+        Auto-merge is already enabled and GitHub will handle the merge.
+        Output: CI_DONE
+
+        ## If any check FAILED
+
+        1. Identify which check failed from the output
+        2. Get the failure logs: `gh run view <RUN_ID> --log-failed 2>&1 | tail -80`
+        3. Read the relevant source files and fix the issue
+        4. Run the project's local validation/test commands to verify your fix
+        5. Commit the fix with a descriptive message and push:
+           ```bash
+           git add -A
+           git commit -m "fix: <description of CI failure fix>"
+           git push
+           ```
+        6. End this iteration normally (do NOT output CI_DONE) — the next iteration will re-check CI
+
+        ## Important
+
+        - Be concise. Focus on fixing the failure, not explaining it.
+        - Only fix what CI reports as broken — don't refactor or improve unrelated code.
+        - If the failure is environmental (flaky test, infra issue), retry once before trying to fix code.
+      until: CI_DONE
+      max_iterations: 4
+      fresh_context: true

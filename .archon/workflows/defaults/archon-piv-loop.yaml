@@ -614,6 +614,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: fix-feedback
+    model: haiku
     depends_on: [code-review]
     loop:
       prompt: |

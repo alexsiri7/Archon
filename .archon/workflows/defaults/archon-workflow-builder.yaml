@@ -202,6 +202,7 @@ nodes:
     depends_on: [generate-yaml]
 
   - id: save-or-report
+    model: haiku
     prompt: |
       You are a workflow installer. Save the generated workflow and report to the user.
 
