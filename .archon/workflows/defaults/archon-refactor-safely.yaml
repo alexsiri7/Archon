@@ -207,7 +207,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: execute-refactor
-    model: claude-opus-4-6[1m]
+    model: sonnet
     prompt: |
       You are executing a refactoring plan with strict safety guardrails.
 
@@ -327,6 +327,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: fix-failures
+    model: haiku
     prompt: |
       Review the validation output below.
 
@@ -430,6 +431,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: create-pr
+    model: haiku
     prompt: |
       Create a pull request for the refactoring.
 

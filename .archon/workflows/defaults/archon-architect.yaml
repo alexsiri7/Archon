@@ -253,6 +253,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: fix-failures
+    model: haiku
     prompt: |
       Review the validation output below.
 
@@ -298,6 +299,7 @@ nodes:
   # ═══════════════════════════════════════════════════════════════
 
   - id: create-pr
+    model: haiku
     prompt: |
       Create a pull request for the architectural improvements.
 
