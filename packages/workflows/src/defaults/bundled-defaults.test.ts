@@ -90,6 +90,7 @@ describe('bundled-defaults', () => {
         'archon-interactive-prd',
         'archon-piv-loop',
         'archon-adversarial-dev',
+        'archon-triage-issue',
         'archon-workflow-builder',
       ];
 
@@ -97,7 +98,7 @@ describe('bundled-defaults', () => {
         expect(BUNDLED_WORKFLOWS).toHaveProperty(wf);
       }
 
-      expect(Object.keys(BUNDLED_WORKFLOWS)).toHaveLength(13);
+      expect(Object.keys(BUNDLED_WORKFLOWS)).toHaveLength(14);
     });
 
     it('should have non-empty content for all workflows', () => {
