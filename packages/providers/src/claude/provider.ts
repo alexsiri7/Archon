@@ -372,11 +372,14 @@ async function applyNodeConfig(
       nodeConfig.hooks as Record<string, YAMLHookMatcher[] | undefined>
     );
     if (Object.keys(builtHooks).length > 0) {
+      if (!options.hooks) {
+        options.hooks = {};
+      }
       // Merge with existing hooks (PostToolUse capture hook)
-      const existingHooks = options.hooks as SDKHooksMap | undefined;
+      const existingHooks = options.hooks as SDKHooksMap;
       for (const [event, matchers] of Object.entries(builtHooks)) {
         if (!matchers) continue;
-        const existing = existingHooks?.[event] as HookCallbackMatcher[] | undefined;
+        const existing = existingHooks[event] as HookCallbackMatcher[] | undefined;
         if (existing) {
           (options.hooks as Record<string, HookCallbackMatcher[]>)[event] = [
             ...(matchers as HookCallbackMatcher[]),
