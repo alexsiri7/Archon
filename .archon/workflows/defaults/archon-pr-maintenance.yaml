@@ -56,7 +56,7 @@ nodes:
 
   - id: checkout-and-diagnose
     bash: |
-      PR_NUMBER="$find-pr.output"
+      PR_NUMBER=$find-pr.output
 
       # Checkout the PR branch
       gh pr checkout "$PR_NUMBER"

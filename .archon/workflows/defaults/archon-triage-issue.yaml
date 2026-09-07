@@ -24,7 +24,7 @@ nodes:
 
   - id: fetch-issue
     bash: |
-      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      ISSUE_NUM=$(echo $extract-issue-number.output | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
       if [ -z "$ISSUE_NUM" ]; then
         echo "Failed to extract issue number" >&2
         exit 1
@@ -53,13 +53,13 @@ nodes:
 
   - id: apply-label
     bash: |
-      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      ISSUE_NUM=$(echo $extract-issue-number.output | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
       if [ -z "$ISSUE_NUM" ]; then
         echo "Failed to extract issue number" >&2
         exit 1
       fi
       REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner')
-      RESULT=$(echo "$classify.output" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' \
+      RESULT=$(echo $classify.output | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' \
         | grep -E '^(bug|enhancement|skip)$' || echo "bug")
 
       gh issue edit "$ISSUE_NUM" --repo "$REPO" \
