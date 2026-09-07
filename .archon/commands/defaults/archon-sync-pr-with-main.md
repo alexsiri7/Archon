@@ -15,6 +15,12 @@ Ensure the PR branch is up-to-date with the latest main branch before review. Re
 
 ---
 
+## Safety Constraints
+
+You are only authorized to rebase the PR branch onto the base branch and push the *rebased* result (same diff content, replayed onto a newer base). You are never authorized to close the PR, disable auto-merge, or push anything that discards/resets the PR's actual changes (e.g. force-pushing the base branch's tip, or any state whose diff against the base is smaller than what the PR had before). `git push --force-with-lease` in Phase 5.1 exists solely to publish the rebase — if a rebase cannot be completed cleanly, `git rebase --abort` and report failure (Phase 7) rather than taking any other action on the PR.
+
+---
+
 ## Phase 1: CHECK - Determine if Sync Needed
 
 ### 1.1 Get PR Number from Registry

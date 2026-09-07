@@ -15,6 +15,12 @@ Verify the PR is in a reviewable state, gather all context needed for the parall
 
 ---
 
+## Safety Constraints
+
+This command only gathers context and, if conflicts block scoping, may rebase-and-push (`--force-with-lease`) to republish the *same* diff on a newer base. It is never authorized to close the PR, disable auto-merge, or push/reset the branch to anything with less diff than it started with. If the PR can't be scoped or conflicts can't be resolved, exit the workflow and report — do not act on the PR's lifecycle state yourself.
+
+---
+
 ## Phase 1: IDENTIFY - Determine PR
 
 ### 1.1 Get PR Number

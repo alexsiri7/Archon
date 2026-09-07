@@ -8,6 +8,7 @@ description: |
   NOT for: Single-file fixes, feature development, architecture review.
 
 provider: claude
+model: sonnet
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -115,6 +116,7 @@ nodes:
       - Fix: specific code change needed
     depends_on: [scan-surface]
     context: fresh
+    model: claude-fable-5[1m]
     denied_tools: [Write, Edit, Bash]
 
   - id: auth-agent
@@ -140,6 +142,7 @@ nodes:
       Write findings to $ARTIFACTS_DIR/auth-findings.md — same format as injection agent (AUTH-001, etc.)
     depends_on: [scan-surface]
     context: fresh
+    model: claude-fable-5[1m]
     denied_tools: [Write, Edit, Bash]
 
   - id: data-privacy-agent
@@ -166,6 +169,7 @@ nodes:
       Write findings to $ARTIFACTS_DIR/privacy-findings.md — same format (PRIV-001, etc.)
     depends_on: [scan-surface]
     context: fresh
+    model: claude-fable-5[1m]
     denied_tools: [Write, Edit, Bash]
 
   - id: config-deps-agent
@@ -192,6 +196,7 @@ nodes:
       Write findings to $ARTIFACTS_DIR/config-findings.md — same format (CFG-001, etc.)
     depends_on: [scan-surface]
     context: fresh
+    model: claude-fable-5[1m]
     denied_tools: [Write, Edit, Bash]
 
   - id: logic-agent
@@ -218,6 +223,7 @@ nodes:
       Write findings to $ARTIFACTS_DIR/logic-findings.md — same format (LOGIC-001, etc.)
     depends_on: [scan-surface]
     context: fresh
+    model: claude-fable-5[1m]
     denied_tools: [Write, Edit, Bash]
 
   # ═══════════════════════════════════════════════════════════════
@@ -275,6 +281,7 @@ nodes:
     depends_on: [injection-agent, auth-agent, data-privacy-agent, config-deps-agent, logic-agent]
     trigger_rule: one_success
     context: fresh
+    model: claude-fable-5[1m]
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 4: FIX CRITICAL & HIGH

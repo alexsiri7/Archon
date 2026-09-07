@@ -27,6 +27,22 @@ Read the consolidated review artifact and implement all CRITICAL and HIGH priori
 
 ---
 
+## Safety Constraints (READ BEFORE TOUCHING THE PR)
+
+This command's authority is limited to **adding fix commits on top of the PR's existing history and posting a comment**. It is never authorized to change the PR's lifecycle state or discard its history, no matter what the review found — including when 0 CRITICAL/HIGH issues exist, or when a MEDIUM/LOW issue (e.g. "missing issue reference") looks unfixable by code.
+
+**NEVER, under any circumstance:**
+- Close the PR (`gh pr close`).
+- Disable auto-merge on the PR (`gh pr merge --disable-auto` or equivalent).
+- Force-push a branch state that discards, resets, or rewinds the PR's existing diff (e.g. resetting the branch to match `main`/the base branch). `git push --force-with-lease` in Phase 4.3 must only ever be used to push new commits **on top of** the branch's current history (e.g. after `git pull --rebase`) — never to replace the branch's content with something that has a smaller diff than before.
+- Take any other action that a human reviewer would need to explicitly approve (see the general operating principle: destructive or hard-to-reverse actions on shared state require human sign-off, not agent judgment).
+
+**If you encounter a MEDIUM/LOW issue you cannot fix in code** (missing issue reference, missing screenshot tests, a process/policy gap, etc.): document it in the "MEDIUM Issues" / "LOW Issues" section of the fix report exactly as the template below specifies, and stop there. Do not act on it further. A human (or the PR's original author) decides whether and how to address it — this command's job ends at reporting.
+
+If you ever find yourself reaching for `gh pr close`, `--force` push without `--lease`, or any command that would make the PR's diff smaller than it was before you started, stop and treat that as a bug in your own reasoning, not a valid cleanup step.
+
+---
+
 ## Phase 1: LOAD - Get Fix List
 
 ### 1.1 Get PR Number from Registry

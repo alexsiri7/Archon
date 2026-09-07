@@ -13,6 +13,7 @@ description: |
   - Different nodes have different trust levels and steering
 
 provider: claude
+model: sonnet
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -98,6 +99,7 @@ nodes:
       - For each finding: file, what's wrong, why it matters, estimated effort
     depends_on: [scan-metrics]
     context: fresh
+    model: claude-fable-5[1m]
     denied_tools: [Write, Edit, Bash]
     hooks:
       PostToolUse:
@@ -149,6 +151,7 @@ nodes:
     depends_on: [analyze]
     allowed_tools: [Read]
     context: fresh
+    model: claude-fable-5[1m]
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 4: EXECUTE

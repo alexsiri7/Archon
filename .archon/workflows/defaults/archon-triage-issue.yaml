@@ -38,9 +38,12 @@ nodes:
       Classify this GitHub issue as exactly one of: bug, enhancement, skip
 
       Rules:
-      - bug: something is broken or not working as expected
-      - enhancement: a new feature, improvement, or change request
-      - skip: vague, unclear, duplicate, or requires human decision only
+      - bug: something is broken, not working as expected, a security vulnerability, a crash, or a regression
+      - enhancement: a new feature, improvement, refactor, performance improvement, or any actionable change request
+      - skip: ONLY for issues that are completely nonsensical — spam, empty body, unintelligible text, or obvious test submissions with no real content
+
+      Important: complexity, security sensitivity, or needing careful review are NOT reasons to skip.
+      When in doubt, classify as bug or enhancement. Skip is a last resort.
 
       Issue:
       $fetch-issue.output
@@ -50,10 +53,14 @@ nodes:
 
   - id: apply-label
     bash: |
-      ISSUE_NUM=$(echo "$fetch-issue.output" | jq -r '.number')
+      ISSUE_NUM=$(echo "$extract-issue-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number" >&2
+        exit 1
+      fi
       REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner')
       RESULT=$(echo "$classify.output" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' \
-        | grep -E '^(bug|enhancement|skip)$' || echo "skip")
+        | grep -E '^(bug|enhancement|skip)$' || echo "bug")
 
       gh issue edit "$ISSUE_NUM" --repo "$REPO" \
         --remove-label "archon:triage-in-progress" 2>/dev/null || true
@@ -68,4 +75,4 @@ nodes:
           echo "Triaged #$ISSUE_NUM as non-actionable (archon:skipped)"
           ;;
       esac
-    depends_on: [classify]
+    depends_on: [extract-issue-number, classify]

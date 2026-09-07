@@ -1,0 +1,393 @@
+name: archon-requirements-audit
+description: |
+  Use when: User wants a requirements-to-code traceability audit.
+  Triggers: "requirements audit", "traceability audit", "requirements coverage",
+            "verify requirements", "trace requirements", "coverage.yaml",
+            "which requirements are implemented", "orphaned behavior".
+  Does: Loads requirements/requirements.yaml -> maps repo structure -> traces every
+        requirement to implementing code and verifying tests (and the reverse pass:
+        code behavior with no requirement) -> regenerates requirements/coverage.yaml ->
+        files requirements-gap issues -> draft PR with the regenerated coverage file.
+  NOT for: Writing requirements from scratch (run requirements back-porting first),
+           feature development, security or test audits.
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: LOAD REQUIREMENTS
+  # Deterministic gate: emits the requirements file verbatim, or the
+  # exact sentinel NO_REQUIREMENTS_FILE when the repo has none yet.
+  # Downstream `when:` gates compare against that sentinel, so the
+  # whole audit skips gracefully (nodes skip, run succeeds) instead
+  # of erroring on repos where back-porting has not landed.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: load-requirements
+    bash: |
+      if [ -f requirements/requirements.yaml ]; then
+        cat requirements/requirements.yaml
+      else
+        echo "NO_REQUIREMENTS_FILE"
+      fi
+    timeout: 30000
+
+  # Graceful exit path: this is the only downstream node that runs when
+  # the requirements file is missing. The run completes successfully with
+  # this report as its outcome.
+  - id: report-missing
+    model: haiku
+    when: "$load-requirements.output == 'NO_REQUIREMENTS_FILE'"
+    prompt: |
+      This repository has no requirements/requirements.yaml, so the
+      requirements-to-code traceability audit cannot run.
+
+      Produce a short, clear report (plain text, no tools needed) stating:
+
+      1. "No requirements file found — run requirements back-porting first."
+      2. What was looked for: `requirements/requirements.yaml` at the repo root.
+      3. What the file must contain before this audit can run: a `meta:` block
+         (project, prefix, ported date) and a `requirements:` list of entries with
+         id, title, statement (EARS), category (functional|non-functional|constraint),
+         priority (must|should|may), status (active|deprecated), source, and
+         acceptance criteria.
+      4. That no code was analyzed, no issues were filed, and no PR was created.
+
+      Output only the report.
+    depends_on: [load-requirements]
+    context: fresh
+    denied_tools: [Write, Edit, Bash]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: MAP REPO STRUCTURE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scan-structure
+    model: sonnet
+    when: "$load-requirements.output != 'NO_REQUIREMENTS_FILE'"
+    prompt: |
+      You are mapping a repository so that requirement-tracing agents can navigate it quickly.
+
+      ## Instructions
+
+      Explore the repository (directory listings, key file reads, targeted greps) and produce
+      a concise structural map covering:
+
+      1. **Layout**: top-level directories and what lives in each (source, tests, config,
+         scripts, docs, infra). Note the language(s) and framework(s).
+      2. **Entry points**: main/server/CLI entry files, route registrations, background jobs,
+         cron/scheduled tasks, exported public APIs.
+      3. **Core modules**: the files where business logic actually lives (not glue), with a
+         one-line summary each.
+      4. **Test layout**: where tests live, the test runner(s), naming conventions
+         (test_*.py, *.test.ts, __tests__/, etc.), and any fixtures/helpers directories.
+      5. **Data layer**: schema/migration/model files, external services called.
+
+      Keep it under ~150 lines — this is a navigation aid, not an audit.
+
+      ## Output
+
+      Return the map as your final response, using the section headings above.
+    depends_on: [load-requirements]
+    context: fresh
+    denied_tools: [Write, Edit]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: TRACE (parallel, deep reasoning)
+  # Forward: every requirement -> code + tests + verdict.
+  # Reverse: significant code behavior -> requirement, or orphan.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: trace-forward
+    prompt: |
+      You are a requirements traceability specialist performing the **forward pass**:
+      requirement -> implementing code -> verifying tests.
+
+      ## Requirements File (requirements/requirements.yaml)
+
+      $load-requirements.output
+
+      ## Repository Map
+
+      $scan-structure.output
+
+      ## Requirement entry format
+
+      Each entry has: id, title, statement (EARS form), category
+      (functional|non-functional|constraint), priority (must|should|may),
+      status (active|deprecated), source, acceptance (list of criteria), notes?.
+
+      ## Instructions
+
+      For EVERY requirement with status `active` (list `deprecated` ones separately,
+      unaudited):
+
+      1. Read the code that should implement the statement. Follow the repository map,
+         then grep/read as needed. Record the actual file paths (with line ranges where
+         useful).
+      2. Find the tests that verify it. Match tests against the requirement's
+         **acceptance criteria** — a test counts as verifying only if it exercises an
+         acceptance criterion, not merely touches the same file.
+      3. Compare the code's ACTUAL behavior against the requirement statement — read the
+         code, do not assume from names.
+      4. Assign exactly one verdict:
+         - **covered**: implemented as stated AND acceptance criteria are exercised by tests
+         - **partial**: implemented (or mostly) but acceptance criteria are not fully
+           tested, or only part of the statement is implemented
+         - **uncovered**: no implementing code found
+         - **stale**: implementing code exists but its actual behavior no longer matches
+           the statement (the requirement or the code has drifted)
+
+      Be conservative: if you cannot confirm a test exercises an acceptance criterion,
+      the verdict is at best partial.
+
+      ## Output
+
+      Return your findings as your final response:
+
+      For each requirement:
+      - id, title, verdict
+      - code_paths: implementing files (empty list if uncovered)
+      - test_paths: verifying test files (empty list if none)
+      - notes: one or two sentences of evidence — for stale, state exactly how the
+        behavior diverges from the statement
+
+      End with a tally: counts per verdict, plus the list of deprecated ids skipped.
+    depends_on: [load-requirements, scan-structure]
+    context: fresh
+    model: claude-fable-5[1m]
+    denied_tools: [Write, Edit]
+
+  - id: trace-reverse
+    prompt: |
+      You are a requirements traceability specialist performing the **reverse pass**:
+      code behavior -> requirement, hunting for orphans.
+
+      ## Requirements File (requirements/requirements.yaml)
+
+      $load-requirements.output
+
+      ## Repository Map
+
+      $scan-structure.output
+
+      ## Instructions
+
+      1. Walk the entry points and core modules from the map and enumerate the
+         **significant behaviors** the code actually implements: user-facing features,
+         API endpoints, background jobs, data invariants, integrations, notable
+         non-functional guarantees (auth gates, rate limits, retention rules).
+      2. For each behavior, check whether ANY requirement's statement or acceptance
+         criteria plausibly covers it.
+      3. A behavior with NO covering requirement is an **orphan**. Ignore trivial
+         plumbing (logging, config parsing, framework boilerplate) — orphans are
+         behaviors a product owner would expect to see written down.
+      4. For each orphan, draft a `suggested_requirement`: a single EARS-form statement
+         ("When <trigger>, the system shall <response>" or "The system shall ...")
+         that would cover it.
+
+      ## Output
+
+      Return your findings as your final response:
+
+      For each orphan:
+      - behavior: one-line description
+      - code_paths: files implementing it
+      - suggested_requirement: the drafted EARS statement
+
+      End with a count of orphans found and a one-paragraph note on overall drift
+      (is the requirements file tracking reality?).
+    depends_on: [load-requirements, scan-structure]
+    context: fresh
+    model: claude-fable-5[1m]
+    denied_tools: [Write, Edit]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: SYNTHESIZE -> regenerate requirements/coverage.yaml
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    prompt: |
+      You are the lead auditor. Merge the forward and reverse traces into the
+      machine-readable coverage file.
+
+      ## Forward Trace (requirement -> code/tests)
+
+      $trace-forward.output
+
+      ## Reverse Trace (orphan behaviors)
+
+      $trace-reverse.output
+
+      ## Instructions
+
+      1. Cross-check the two passes: if the reverse pass found behavior that the forward
+         pass mapped to a requirement, it is not an orphan — drop it. If the passes
+         disagree about a requirement, read the code yourself and decide.
+      2. Write `requirements/coverage.yaml` (overwrite it — this file is REGENERATED on
+         every audit run, never hand-edited) with exactly this shape:
+
+         ```yaml
+         meta:
+           generated: <today's date, YYYY-MM-DD>
+           workflow: archon-requirements-audit
+           totals:
+             covered: <n>
+             partial: <n>
+             uncovered: <n>
+             stale: <n>
+             orphans: <n>
+         coverage:
+           - id: <requirement id>
+             status: covered | partial | uncovered | stale
+             code_paths: [<paths>]
+             test_paths: [<paths>]
+             notes: <one-line evidence>
+         orphans:
+           - behavior: <one-line description>
+             code_paths: [<paths>]
+             suggested_requirement: <EARS statement>
+         ```
+
+         Every active requirement id from the forward trace appears exactly once under
+         `coverage:`. Keep notes to a single line. Valid YAML — quote strings containing
+         colons.
+      3. Verify the file parses: `bun -e "const f=await Bun.file('requirements/coverage.yaml').text(); const {parse}=await import('yaml'); parse(f); console.log('OK')"`
+         (or `python3 -c "import yaml,sys; yaml.safe_load(open('requirements/coverage.yaml')); print('OK')"`).
+
+      ## Output
+
+      Return as your final response:
+      - The totals block
+      - **Significant gaps** — the list of uncovered and stale requirements (id, title,
+        one-line reason) and notable orphans (behavior, suggested_requirement). This
+        list is what the issue-filing node acts on, so include everything issue-worthy
+        and nothing else.
+    depends_on: [trace-forward, trace-reverse]
+    trigger_rule: one_success
+    context: fresh
+    model: claude-fable-5[1m]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE the regenerated coverage file
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    bash: |
+      echo "=== VALIDATING requirements/coverage.yaml ==="
+      if [ ! -f requirements/coverage.yaml ]; then
+        echo "coverage.yaml was not generated"
+        echo "VALIDATION_STATUS: FAIL"
+        exit 0
+      fi
+      if python3 -c "import yaml,sys; d=yaml.safe_load(open('requirements/coverage.yaml')); assert isinstance(d, dict) and 'meta' in d and 'coverage' in d, 'missing meta/coverage keys'" 2>&1 \
+         || bun -e "const {parse}=await import('yaml'); const d=parse(await Bun.file('requirements/coverage.yaml').text()); if(!d||!d.meta||!d.coverage) throw new Error('missing meta/coverage keys')" 2>&1; then
+        echo "VALIDATION_STATUS: PASS"
+      else
+        echo "VALIDATION_STATUS: FAIL"
+      fi
+    depends_on: [synthesize]
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: FILE ISSUES for significant gaps
+  #
+  # Label policy: issues get ONLY the `requirements-gap` label —
+  # deliberately NOT `enhancement` or `bug`. Those labels would make
+  # issue-pickup-cron auto-ingest the issue into the implementation
+  # factory before a human has vetted whether the gap is real and
+  # worth building. A human promotes a vetted gap by adding
+  # enhancement/bug themselves.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: file-issues
+    model: sonnet
+    prompt: |
+      File GitHub issues for the significant traceability gaps found by the audit.
+
+      ## Audit Summary
+
+      $synthesize.output
+
+      ## Validation
+
+      $validate.output
+
+      ## Instructions
+
+      1. Ensure the label exists (safe if it already does):
+         ```bash
+         gh label create requirements-gap --description "Requirements traceability gap found by archon-requirements-audit" --color D93F0B || true
+         ```
+      2. List existing open issues to avoid duplicates:
+         `gh issue list --label requirements-gap --state open --limit 100`
+         If an open issue already covers a gap (same requirement id or same orphan
+         behavior in the title), skip it.
+      3. For each **significant** gap in the audit summary, create ONE issue:
+         - Uncovered requirement — title: `[req-gap] <ID>: not implemented — <title>`
+         - Stale requirement — title: `[req-gap] <ID>: implementation drifted — <title>`
+         - Notable orphan — title: `[req-gap] orphan: <behavior>`
+         Body: the requirement statement (or suggested_requirement for orphans),
+         the verdict and evidence from the audit, relevant code/test paths, and a
+         "Suggested next step" line (implement, add tests, update the requirement,
+         or adopt the suggested requirement).
+      4. Label each issue with ONLY `requirements-gap` — do NOT add `enhancement`,
+         `bug`, or any other label (see the label policy comment in this workflow:
+         those labels trigger automatic factory ingestion before human vetting).
+      5. Use judgment on "significant": every uncovered/stale `must` requirement is
+         significant; skip `may` requirements and cosmetic orphans unless the audit
+         flagged them as risky.
+
+      ## Output
+
+      List the issues created (number + title) and the gaps skipped as duplicates
+      or insignificant, with one-line reasons.
+    depends_on: [validate]
+    context: fresh
+    denied_tools: [Write, Edit]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: DRAFT PR with the regenerated coverage.yaml
+  # Draft on purpose — a human reviews coverage changes; nothing here
+  # marks the PR ready or enables auto-merge.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a DRAFT pull request containing only the regenerated coverage file.
+
+      ## Context
+      - Audit summary: $synthesize.output
+      - Validation: $validate.output
+      - Issues filed: $file-issues.output
+
+      ## Instructions
+
+      1. Check `git status --porcelain` — the only intended change is
+         `requirements/coverage.yaml`. If it is unchanged, report "coverage.yaml
+         unchanged — no PR needed" and stop.
+      2. Stage and commit ONLY that file:
+         ```bash
+         git add requirements/coverage.yaml
+         git commit -m "docs(requirements): regenerate coverage.yaml from traceability audit"
+         ```
+      3. Push: `git push -u origin HEAD`
+      4. Create the PR as a DRAFT (do NOT mark it ready, do NOT enable auto-merge):
+         ```bash
+         gh pr create --draft --title "docs(requirements): regenerate coverage.yaml" --body-file -
+         ```
+         Body: the totals block, the list of filed requirements-gap issues, and a note
+         that coverage.yaml is machine-generated by archon-requirements-audit.
+      5. Save the PR URL to `$ARTIFACTS_DIR/.pr-url`
+    depends_on: [file-issues]
+    context: fresh
+    model: haiku
+    hooks:
+      PreToolUse:
+        - matcher: "Write|Edit"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              permissionDecision: deny
+              permissionDecisionReason: "PR creation node — do not modify source files. Use only git and gh commands."

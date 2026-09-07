@@ -9,6 +9,7 @@ description: |
            PR-scoped test review (that's the test-coverage-agent in review workflows).
 
 provider: claude
+model: sonnet
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -210,6 +211,7 @@ nodes:
       Numbered plan. Be specific — the implement node will follow this literally.
     depends_on: [coverage-gap-agent, flaky-test-agent]
     context: fresh
+    model: claude-fable-5[1m]
     allowed_tools: [Read]
 
   # ═══════════════════════════════════════════════════════════════
