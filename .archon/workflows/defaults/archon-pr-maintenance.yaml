@@ -38,7 +38,9 @@ nodes:
       # Priority: BEHIND (just needs rebase) > DIRTY (conflicts) > UNSTABLE (CI failing)
       # Skip CLEAN (handled by wrapper script) and BLOCKED (can't do anything).
       for STATUS in BEHIND DIRTY UNSTABLE UNKNOWN; do
-        PR=$(gh pr list --state open --json number,mergeStateStatus,isDraft \
+        # Fork-safe target: without --repo, gh resolves to the upstream parent in fork clones
+        ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+        PR=$(gh pr list --repo "$ORIGIN_REPO" --state open --json number,mergeStateStatus,isDraft \
           --jq "[.[] | select(.isDraft == false and .mergeStateStatus == \"$STATUS\")] | .[0].number // empty")
         if [ -n "$PR" ]; then
           echo "$PR"

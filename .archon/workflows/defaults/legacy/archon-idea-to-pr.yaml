@@ -103,8 +103,10 @@ nodes:
         echo "No PR number found, skipping auto-merge"
         exit 0
       fi
-      gh pr ready "$PR_NUMBER" 2>/dev/null || true
-      gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>&1 || echo "Auto-merge not available, PR left open for manual merge"
+      # Fork-safe target: without --repo, gh resolves to the upstream parent in fork clones
+      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      gh pr ready --repo "$ORIGIN_REPO" "$PR_NUMBER" 2>/dev/null || true
+      gh pr merge --repo "$ORIGIN_REPO" "$PR_NUMBER" --squash --auto --delete-branch 2>&1 || echo "Auto-merge not available, PR left open for manual merge"
     depends_on: [workflow-summary]
 
 # Deprecated legacy default (#2781): announce removal in the run-start notice during this window.

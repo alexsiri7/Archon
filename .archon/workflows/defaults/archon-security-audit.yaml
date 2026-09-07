@@ -371,8 +371,10 @@ nodes:
       6. Mark ready and enable auto-merge:
          ```bash
          PR_NUM=$(cat $ARTIFACTS_DIR/.pr-number)
-         gh pr ready "$PR_NUM"
-         gh pr merge "$PR_NUM" --squash --auto --delete-branch
+         # Fork-safe target: without --repo, gh resolves to the upstream parent in fork clones
+         ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+         gh pr ready --repo "$ORIGIN_REPO" "$PR_NUM"
+         gh pr merge --repo "$ORIGIN_REPO" "$PR_NUM" --squash --auto --delete-branch
          ```
 
       ### Step 2: Create issues for MEDIUM/LOW findings

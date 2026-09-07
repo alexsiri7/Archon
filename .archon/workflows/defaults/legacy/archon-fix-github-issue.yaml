@@ -407,8 +407,10 @@ nodes:
         echo "No PR number found, skipping auto-merge"
         exit 0
       fi
+      # Fork-safe target: without --repo, gh resolves to the upstream parent in fork clones
+      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
       # Mark PR as ready for review (remove draft status)
-      gh pr ready "$PR_NUMBER" 2>/dev/null || true
+      gh pr ready --repo "$ORIGIN_REPO" "$PR_NUMBER" 2>/dev/null || true
       # Push an empty commit to re-trigger CI on the final state.
       # Prior steps (simplify, self-fix) may have pushed after the last CI run,
       # leaving required status checks missing on HEAD.
@@ -417,7 +419,7 @@ nodes:
       # Enable auto-merge early — GitHub will merge once CI passes.
       # This way, if the watch-and-merge loop exits (max iterations),
       # the PR still merges automatically when CI eventually goes green.
-      gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>&1 || echo "Auto-merge not available, will retry in watch loop"
+      gh pr merge --repo "$ORIGIN_REPO" "$PR_NUMBER" --squash --auto --delete-branch 2>&1 || echo "Auto-merge not available, will retry in watch loop"
       echo "$PR_NUMBER"
     depends_on: [report]
 
