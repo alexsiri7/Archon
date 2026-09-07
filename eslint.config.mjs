@@ -14,9 +14,14 @@ export default tseslint.config(
       '.agents/examples/**',
       'packages/docs-web/**',
       'workspace/**',
+      // Nested git worktrees are separate checkouts that lint on their own branch.
+      // Their files are outside every tsconfig project here, so typed rules crash on them.
       'worktrees/**',
+      '.worktrees/**',
       '.claude/worktrees/**',
       '.claude/skills/**',
+      '.archon/**', // User workflow/script/command content — not in any tsconfig project
+      '**/*.generated.ts', // Auto-generated source files (content inlined via JSON.stringify)
       '**/*.js',
       '*.mjs',
       '**/*.test.ts',
@@ -41,7 +46,7 @@ export default tseslint.config(
 
   // Project-specific settings
   {
-    files: ['packages/*/src/**/*.{ts,tsx}'],
+    files: ['packages/*/src/**/*.{ts,tsx}', 'scripts/**/*.ts'],
     languageOptions: {
       parserOptions: {
         projectService: true,
@@ -106,6 +111,48 @@ export default tseslint.config(
       '@typescript-eslint/require-await': 'off',
       // Constructor style preference
       '@typescript-eslint/consistent-generic-constructors': 'off',
+    },
+  },
+
+  // Console spike (packages/web/src/experiments/console/**) — isolation guard.
+  // This experiment must not couple to the production web UI's state/components
+  // so that it can be extracted or discarded cleanly.
+  {
+    files: ['packages/web/src/experiments/console/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              // `**` matches nested paths too; the single `*` form let
+              // experiments couple to `@/components/layout/...` etc.
+              group: [
+                '@/components/**',
+                '@/contexts/**',
+                '@/hooks/**',
+                '@/routes/**',
+                '@/stores/**',
+              ],
+              message:
+                'The console spike must not import from production web UI modules. See packages/web/src/experiments/console/README.md.',
+            },
+            {
+              // Block every named import from `@/lib/api` — only generated
+              // types from `@/lib/api.generated` are allowed (different
+              // module path, not matched by this glob).
+              group: ['@/lib/api'],
+              message:
+                'Import only types from @/lib/api.generated. Skill calls go through packages/web/src/experiments/console/skills/.',
+            },
+            {
+              group: ['@tanstack/react-query'],
+              message:
+                'The console spike uses its own reactive store (store/cache.ts). No React Query.',
+            },
+          ],
+        },
+      ],
     },
   }
 );

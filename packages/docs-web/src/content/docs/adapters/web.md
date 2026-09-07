@@ -72,7 +72,7 @@ The center of the screen is the chat interface -- this is where you interact wit
 
 ### Command Center (Dashboard)
 
-Accessible via the `/dashboard` route, the Command Center shows all workflow runs across your projects. It includes:
+Accessible via the `/legacy/dashboard` route, the Command Center shows all workflow runs across your projects. It includes:
 
 - **Status summary bar** -- Counts of running, completed, failed, and paused workflows
 - **Workflow run cards** -- Each run shows its status, workflow name, elapsed time, and node progress
@@ -81,7 +81,7 @@ Accessible via the `/dashboard` route, the Command Center shows all workflow run
 
 ### Settings
 
-The `/settings` page lets you configure assistant defaults (model, provider) without editing YAML files.
+The `/legacy/settings` page lets you configure assistant defaults (model, provider) without editing YAML files. It also includes a **Projects** section for registering and managing codebases.
 
 ## Chat Interface
 
@@ -154,7 +154,7 @@ Click the arrow button in the result card header to open the full execution deta
 
 ### Execution Detail Page
 
-Click on a workflow run (from the dashboard or progress card) to open the execution detail page at `/workflows/runs/:runId`. This shows:
+Click on a workflow run (from the dashboard or progress card) to open the execution detail page at `/legacy/workflows/runs/:runId`. This shows:
 
 - The full DAG graph with per-node status
 - Step-by-step logs for each node
@@ -163,18 +163,25 @@ Click on a workflow run (from the dashboard or progress card) to open the execut
 
 ## Workflow Builder
 
-The Workflow Builder at `/workflows/builder` provides a visual editor for creating and modifying workflow YAML files. Features include:
+The Workflow Builder at `/legacy/workflows/builder` provides a visual editor for creating and modifying workflow YAML files. Features include:
 
 - **DAG canvas** -- Drag-and-drop nodes to build your workflow graph visually
-- **Node palette** -- Add command, prompt, bash, and loop nodes from a sidebar library
+- **Node palette** -- Drag command, prompt, and bash nodes from a sidebar library. Additional node types (`script`, `loop`, `approval`, `cancel`) are editable via the Code / Split view
 - **Node inspector** -- Click a node to configure its properties (command, prompt text, dependencies, model overrides, hooks, MCP servers, etc.) in a tabbed panel
 - **View modes** -- Toggle between Visual, Split, and Code views. Split mode shows the canvas and YAML side by side.
 - **Command picker** -- Browse available commands when configuring command nodes
 - **Validation panel** -- Real-time validation feedback as you build
 - **Undo/redo** -- Full undo/redo stack with keyboard shortcuts
+- **Delete node** -- Remove a selected node with `Delete` or `Backspace`, the Delete button in the inspector header, or the right-click context menu on any node
 - **Save** -- Saves the workflow YAML to your project's `.archon/workflows/` directory
 
-You can also browse existing workflows on the `/workflows` page and open any of them in the builder to edit.
+You can also browse existing workflows on the `/legacy/workflows` page and open any of them in the builder to edit.
+
+### Archon Studio builder (beta)
+
+A rebuilt visual builder is available in the new console at `/console/builder` (reachable from the console sidebar). It is a controlled React Flow canvas with a node palette, per-node inspector, live YAML preview, inline validation panel, smart-guide snapping, marquee selection, and a right-click context menu (add node, cut/copy/duplicate/delete, paste, select all, auto-arrange, fit view). All seven node types (`prompt`, `command`, `bash`, `script`, `loop`, `approval`, `cancel`) are editable directly in the inspector.
+
+This builder is **beta and fixture-backed**: it loads a local example workflow and reports edits in-memory — load/save to `.archon/workflows/` and a live `/console/builder/:name` route land in a later milestone. For saving workflows today, use the `/legacy/workflows/builder` editor above.
 
 ## SSE Streaming
 
@@ -199,14 +206,17 @@ Events streamed over SSE include:
 
 A separate dashboard SSE stream at `/api/stream/__dashboard__` multiplexes workflow events across all conversations, powering the Command Center's live updates.
 
+This stream also covers runs started **out of process** — the `archon` CLI, especially `archon workflow run --detach`. Those runs write their events to the database but never reach the server's in-process emitter, so a server-side poller tails the `workflow_events` table and replays them to `__dashboard__`. On PostgreSQL a `LISTEN/NOTIFY` trigger pushes them in real time; on SQLite the poller picks them up within its poll interval.
+
 ## Projects and Codebases
 
 ### Registering a Project
 
-From the Web UI, you can register codebases in two ways:
+From the Web UI, you can register codebases in three ways:
 
-1. **Clone from URL** -- Use the `/clone <url>` command in chat, or use the API to POST to `/api/codebases` with a `url` field
-2. **Register a local path** -- POST to `/api/codebases` with a `path` field pointing to an existing git repository
+1. **Add Project input** -- Click **+** in the sidebar or go to **Settings → Projects** and enter a GitHub URL or local path. Inputs starting with `https://`, `ssh://`, `git@`, or `git://` are treated as remote URLs (cloned); everything else is treated as a local path (registered in place).
+2. **Clone from URL via chat** -- Use the `/clone <url>` command in chat, or use the API to POST to `/api/codebases` with a `url` field
+3. **Register a local path via API** -- POST to `/api/codebases` with a `path` field pointing to an existing git repository
 
 Registered codebases appear in the sidebar's project selector.
 

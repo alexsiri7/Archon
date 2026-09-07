@@ -9,14 +9,26 @@ import {
   getConfig,
   getHealth,
   listCodebases,
+  listProviders,
   addCodebase,
+  getCodebaseInput,
   deleteCodebase,
   updateAssistantConfig,
   getCodebaseEnvVars,
   setCodebaseEnvVar,
   deleteCodebaseEnvVar,
+  getGithubConnection,
+  startGithubDeviceFlow,
+  pollGithubDeviceFlow,
+  disconnectGithub,
 } from '@/lib/api';
-import type { SafeConfigResponse, CodebaseResponse } from '@/lib/api';
+import type {
+  SafeConfigResponse,
+  CodebaseResponse,
+  ProviderDefaults,
+  ProviderInfo,
+} from '@/lib/api';
+import { CODEX_CONFIG_EFFORT_OPTIONS } from '@/experiments/console/lib/model-options';
 
 const selectClass =
   'h-9 rounded-md border border-border bg-surface-elevated text-text-primary px-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring [&>option]:bg-surface-elevated [&>option]:text-text-primary';
@@ -252,7 +264,7 @@ function EnvVarsPanel({ codebaseId }: { codebaseId: string }): React.ReactElemen
 
 function ProjectsSection(): React.ReactElement {
   const queryClient = useQueryClient();
-  const [addPath, setAddPath] = useState('');
+  const [addValue, setAddValue] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [expandedEnvVars, setExpandedEnvVars] = useState<string | null>(null);
 
@@ -262,10 +274,10 @@ function ProjectsSection(): React.ReactElement {
   });
 
   const addMutation = useMutation({
-    mutationFn: ({ path }: { path: string }) => addCodebase({ path }),
+    mutationFn: (value: string) => addCodebase(getCodebaseInput(value)),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['codebases'] });
-      setAddPath('');
+      setAddValue('');
       setShowAdd(false);
     },
   });
@@ -279,8 +291,8 @@ function ProjectsSection(): React.ReactElement {
 
   function handleAddSubmit(e: React.FormEvent): void {
     e.preventDefault();
-    if (addPath.trim()) {
-      addMutation.mutate({ path: addPath.trim() });
+    if (addValue.trim()) {
+      addMutation.mutate(addValue.trim());
     }
   }
 
@@ -333,11 +345,11 @@ function ProjectsSection(): React.ReactElement {
         {showAdd ? (
           <form onSubmit={handleAddSubmit} className="mt-3 flex gap-2">
             <Input
-              value={addPath}
+              value={addValue}
               onChange={e => {
-                setAddPath(e.target.value);
+                setAddValue(e.target.value);
               }}
-              placeholder="/path/to/repository"
+              placeholder="GitHub URL or local path"
               className="flex-1"
             />
             <Button type="submit" size="sm" disabled={addMutation.isPending}>
@@ -349,7 +361,7 @@ function ProjectsSection(): React.ReactElement {
               size="sm"
               onClick={() => {
                 setShowAdd(false);
-                setAddPath('');
+                setAddValue('');
               }}
             >
               Cancel
@@ -382,31 +394,55 @@ function ProjectsSection(): React.ReactElement {
 
 function AssistantConfigSection({ config }: { config: SafeConfigResponse }): React.ReactElement {
   const queryClient = useQueryClient();
-  const [assistant, setAssistant] = useState(config.assistant);
-  const [claudeModel, setClaudeModel] = useState(config.assistants.claude.model ?? 'sonnet');
-  const [codexModel, setCodexModel] = useState(config.assistants.codex.model ?? '');
-  const [reasoning, setReasoning] = useState<'minimal' | 'low' | 'medium' | 'high' | 'xhigh'>(
-    config.assistants.codex.modelReasoningEffort ?? 'medium'
-  );
-  const [webSearch, setWebSearch] = useState<'disabled' | 'cached' | 'live'>(
-    config.assistants.codex.webSearchMode ?? 'disabled'
+  const { data: providers } = useQuery({
+    queryKey: ['providers'],
+    queryFn: listProviders,
+    staleTime: 5 * 60 * 1000,
+  });
+  const [assistant, setAssistant] = useState<string>(config.assistant);
+  const [assistantSettings, setAssistantSettings] = useState<Record<string, ProviderDefaults>>(
+    config.assistants
   );
   const [saveMsg, setSaveMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
+  const normalizedConfigSettings = JSON.stringify(config.assistants);
+  const normalizedAssistantSettings = JSON.stringify(assistantSettings);
   const hasChanges =
-    assistant !== config.assistant ||
-    claudeModel !== (config.assistants.claude.model ?? 'sonnet') ||
-    codexModel !== (config.assistants.codex.model ?? '') ||
-    reasoning !== (config.assistants.codex.modelReasoningEffort ?? 'medium') ||
-    webSearch !== (config.assistants.codex.webSearchMode ?? 'disabled');
+    assistant !== config.assistant || normalizedAssistantSettings !== normalizedConfigSettings;
 
   useEffect(() => {
     setAssistant(config.assistant);
-    setClaudeModel(config.assistants.claude.model ?? 'sonnet');
-    setCodexModel(config.assistants.codex.model ?? '');
-    setReasoning(config.assistants.codex.modelReasoningEffort ?? 'medium');
-    setWebSearch(config.assistants.codex.webSearchMode ?? 'disabled');
+    setAssistantSettings(config.assistants);
   }, [config]);
+
+  function getProviderSettings(providerId: string): ProviderDefaults {
+    return assistantSettings[providerId] ?? {};
+  }
+
+  function updateProviderSettings(providerId: string, updates: ProviderDefaults): void {
+    setAssistantSettings(current => ({
+      ...current,
+      [providerId]: {
+        ...(current[providerId] ?? {}),
+        ...updates,
+      },
+    }));
+  }
+
+  const allProviderEntries: ProviderInfo[] = [
+    ...(providers ?? []),
+    ...Object.keys(config.assistants)
+      .filter(providerId => !(providers ?? []).some(provider => provider.id === providerId))
+      .map(
+        providerId =>
+          ({
+            id: providerId,
+            displayName: providerId,
+            capabilities: {},
+            builtIn: false,
+          }) satisfies ProviderInfo
+      ),
+  ];
 
   const mutation = useMutation({
     mutationFn: updateAssistantConfig,
@@ -425,14 +461,7 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
   function handleSave(): void {
     mutation.mutate({
       assistant,
-      claude: { model: claudeModel },
-      // The generated type requires `model` when `codex` is present; omit the codex key
-      // entirely when no model is set so the server treats it as "no codex changes".
-      ...(codexModel
-        ? {
-            codex: { model: codexModel, modelReasoningEffort: reasoning, webSearchMode: webSearch },
-          }
-        : {}),
+      assistants: assistantSettings,
     });
   }
 
@@ -449,67 +478,119 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
               id="default-assistant"
               value={assistant}
               onChange={e => {
-                setAssistant(e.target.value as 'claude' | 'codex');
+                setAssistant(e.target.value);
               }}
               className={selectClass}
             >
-              <option value="claude">Claude</option>
-              <option value="codex">Codex</option>
+              {allProviderEntries.map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.displayName}
+                </option>
+              ))}
             </select>
+          </div>
 
-            <label htmlFor="claude-model">Claude Model</label>
-            <select
-              id="claude-model"
-              value={claudeModel}
-              onChange={e => {
-                setClaudeModel(e.target.value);
-              }}
-              className={selectClass}
-            >
-              <option value="sonnet">sonnet</option>
-              <option value="opus">opus</option>
-              <option value="haiku">haiku</option>
-            </select>
+          <div className="space-y-4 border-t pt-4">
+            {allProviderEntries.map(provider => {
+              const providerSettings = getProviderSettings(provider.id);
 
-            <label htmlFor="codex-model">Codex Model</label>
-            <Input
-              id="codex-model"
-              value={codexModel}
-              onChange={e => {
-                setCodexModel(e.target.value);
-              }}
-              placeholder="gpt-5.3-codex"
-            />
+              if (provider.id === 'claude') {
+                return (
+                  <div
+                    key={provider.id}
+                    className="grid grid-cols-[140px_1fr] items-center gap-2 text-sm"
+                  >
+                    <div className="font-medium">{provider.displayName}</div>
+                    <div className="text-muted-foreground">Built-in provider settings</div>
 
-            <label htmlFor="reasoning">Reasoning Effort</label>
-            <select
-              id="reasoning"
-              value={reasoning}
-              onChange={e => {
-                setReasoning(e.target.value as 'minimal' | 'low' | 'medium' | 'high' | 'xhigh');
-              }}
-              className={selectClass}
-            >
-              <option value="minimal">minimal</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-              <option value="xhigh">xhigh</option>
-            </select>
+                    <label htmlFor="claude-model">Model</label>
+                    <select
+                      id="claude-model"
+                      value={(providerSettings.model as string | undefined) ?? 'sonnet'}
+                      onChange={e => {
+                        updateProviderSettings('claude', { model: e.target.value });
+                      }}
+                      className={selectClass}
+                    >
+                      <option value="sonnet">sonnet</option>
+                      <option value="opus">opus</option>
+                      <option value="haiku">haiku</option>
+                    </select>
+                  </div>
+                );
+              }
 
-            <label htmlFor="web-search">Web Search</label>
-            <select
-              id="web-search"
-              value={webSearch}
-              onChange={e => {
-                setWebSearch(e.target.value as 'disabled' | 'cached' | 'live');
-              }}
-              className={selectClass}
-            >
-              <option value="disabled">disabled</option>
-              <option value="cached">cached</option>
-              <option value="live">live</option>
-            </select>
+              if (provider.id === 'codex') {
+                return (
+                  <div
+                    key={provider.id}
+                    className="grid grid-cols-[140px_1fr] items-center gap-2 text-sm"
+                  >
+                    <div className="font-medium">{provider.displayName}</div>
+                    <div className="text-muted-foreground">Built-in provider settings</div>
+
+                    <label htmlFor="codex-model">Model</label>
+                    <Input
+                      id="codex-model"
+                      value={(providerSettings.model as string | undefined) ?? ''}
+                      onChange={e => {
+                        updateProviderSettings('codex', { model: e.target.value });
+                      }}
+                      placeholder="gpt-5.6-sol"
+                    />
+
+                    <label htmlFor="reasoning">Reasoning Effort</label>
+                    <select
+                      id="reasoning"
+                      value={
+                        (providerSettings.modelReasoningEffort as string | undefined) ?? 'medium'
+                      }
+                      onChange={e => {
+                        updateProviderSettings('codex', {
+                          modelReasoningEffort: e.target.value,
+                        });
+                      }}
+                      className={selectClass}
+                    >
+                      {CODEX_CONFIG_EFFORT_OPTIONS.map(effort => (
+                        <option key={effort} value={effort}>
+                          {effort}
+                        </option>
+                      ))}
+                    </select>
+
+                    <label htmlFor="web-search">Web Search</label>
+                    <select
+                      id="web-search"
+                      value={(providerSettings.webSearchMode as string | undefined) ?? 'disabled'}
+                      onChange={e => {
+                        updateProviderSettings('codex', { webSearchMode: e.target.value });
+                      }}
+                      className={selectClass}
+                    >
+                      <option value="disabled">disabled</option>
+                      <option value="cached">cached</option>
+                      <option value="live">live</option>
+                    </select>
+                  </div>
+                );
+              }
+
+              return (
+                <div key={provider.id} className="rounded-md border border-border p-3 text-sm">
+                  <div className="font-medium">{provider.displayName}</div>
+                  <div className="mt-1 text-muted-foreground">
+                    Provider-specific settings are stored generically for Phase 2. This provider
+                    does not have a dedicated editor yet.
+                  </div>
+                  {Object.keys(providerSettings).length > 0 && (
+                    <pre className="mt-2 overflow-x-auto rounded bg-muted p-2 text-xs">
+                      {JSON.stringify(providerSettings, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              );
+            })}
           </div>
 
           <div className="flex items-center gap-3">
@@ -531,16 +612,19 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
 }
 
 function PlatformConnectionsSection({
-  adapter,
+  activePlatforms,
 }: {
-  adapter: string | undefined;
+  activePlatforms: string[] | undefined;
 }): React.ReactElement {
+  const active = new Set(activePlatforms ?? []);
   const platforms = [
-    { name: 'Web', connected: adapter === 'web' },
-    { name: 'Slack', connected: false },
-    { name: 'Telegram', connected: false },
-    { name: 'Discord', connected: false },
-    { name: 'GitHub', connected: false },
+    { name: 'Web', connected: active.has('Web') },
+    { name: 'Slack', connected: active.has('Slack') },
+    { name: 'Telegram', connected: active.has('Telegram') },
+    { name: 'Discord', connected: active.has('Discord') },
+    { name: 'GitHub', connected: active.has('GitHub') },
+    { name: 'Gitea', connected: active.has('Gitea') },
+    { name: 'GitLab', connected: active.has('GitLab') },
   ];
 
   return (
@@ -558,6 +642,131 @@ function PlatformConnectionsSection({
               </Badge>
             </div>
           ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Connect / disconnect the current web user's GitHub identity via the device
+ * flow. The browser polls the server (which proxies a single device-flow poll
+ * per call) at the server-supplied interval until connected, expired, or denied.
+ */
+function GithubIdentitySection(): React.ReactElement {
+  const queryClient = useQueryClient();
+  const { data: status } = useQuery({
+    queryKey: ['github-connection'],
+    queryFn: getGithubConnection,
+    // 401 (web auth not configured) → treat as "unavailable", don't spam retries
+    retry: false,
+  });
+
+  const [userCode, setUserCode] = useState<string | null>(null);
+  const [verificationUri, setVerificationUri] = useState<string | null>(null);
+  const [phase, setPhase] = useState<'idle' | 'pending' | 'error'>('idle');
+  const [message, setMessage] = useState<string | null>(null);
+
+  const connect = useMutation({
+    mutationFn: async (): Promise<void> => {
+      setPhase('pending');
+      setMessage(null);
+      const start = await startGithubDeviceFlow();
+      setUserCode(start.user_code);
+      setVerificationUri(start.verification_uri);
+      const deadline = Date.now() + start.expires_in * 1000;
+      let interval = Math.max(1, start.interval);
+      // Poll until terminal. Each poll is one server-side device-flow check.
+      for (;;) {
+        if (Date.now() > deadline) throw new Error('Device code expired — try again.');
+        await new Promise(r => setTimeout(r, interval * 1000));
+        const res = await pollGithubDeviceFlow(start.device_code);
+        if (res.status === 'connected') return;
+        if (res.status === 'pending') continue;
+        if (res.status === 'expired') throw new Error('Device code expired — try again.');
+        if (res.status === 'denied') throw new Error('Authorization was denied.');
+        // 'error' — back off slightly and surface detail
+        interval += 2;
+        if (res.detail) throw new Error(`GitHub connect failed: ${res.detail}`);
+      }
+    },
+    onSuccess: () => {
+      setPhase('idle');
+      setUserCode(null);
+      setVerificationUri(null);
+      void queryClient.invalidateQueries({ queryKey: ['github-connection'] });
+    },
+    onError: (err: Error) => {
+      setPhase('error');
+      setUserCode(null);
+      setVerificationUri(null);
+      setMessage(err.message);
+    },
+  });
+
+  const disconnect = useMutation({
+    mutationFn: disconnectGithub,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['github-connection'] });
+    },
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>GitHub Identity</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-3 text-sm">
+          {status?.connected ? (
+            <div className="flex items-center justify-between">
+              <span>
+                Connected as <span className="font-medium">@{status.githubLogin}</span>
+              </span>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={disconnect.isPending}
+                onClick={() => {
+                  disconnect.mutate();
+                }}
+              >
+                Disconnect
+              </Button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">
+                Connect your GitHub account so PR comments and commits attribute to you.
+              </span>
+              <Button
+                size="sm"
+                disabled={connect.isPending}
+                onClick={() => {
+                  connect.mutate();
+                }}
+              >
+                {connect.isPending ? 'Connecting…' : 'Connect GitHub'}
+              </Button>
+            </div>
+          )}
+
+          {phase === 'pending' && userCode && verificationUri && (
+            <div className="rounded-md border border-border bg-muted/40 p-3">
+              Visit{' '}
+              <a
+                href={verificationUri}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline"
+              >
+                {verificationUri}
+              </a>{' '}
+              and enter code: <span className="font-mono font-semibold">{userCode}</span>
+            </div>
+          )}
+
+          {phase === 'error' && message && <div className="text-destructive">{message}</div>}
         </div>
       </CardContent>
     </Card>
@@ -641,7 +850,11 @@ export function SettingsPage(): React.ReactElement {
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             {configData && <AssistantConfigSection config={configData.config} />}
-            <PlatformConnectionsSection adapter={health?.adapter} />
+            <PlatformConnectionsSection activePlatforms={health?.activePlatforms} />
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+            <GithubIdentitySection />
           </div>
 
           <ProjectsSection />

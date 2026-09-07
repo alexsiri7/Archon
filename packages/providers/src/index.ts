@@ -4,28 +4,115 @@ export type {
   AgentRequestOptions,
   SendQueryOptions,
   NodeConfig,
+  ProviderDefaults,
+  ProviderDefaultsMap,
+  ProviderRunConfigParser,
   ProviderCapabilities,
+  ProviderRegistration,
+  ProviderInfo,
   MessageChunk,
   TokenUsage,
+  CredentialKind,
+  CredentialSpec,
+  ProviderCredentialCatalog,
 } from './types';
+export { CREDENTIAL_KINDS } from './types';
 
 // Provider config types (canonical definitions in ./types, re-exported via config modules)
 // Import from ./types directly or from the config modules — both work.
 
-// Factory
-export { getAgentProvider } from './factory';
+// Registry
+export {
+  registerProvider,
+  getAgentProvider,
+  getRegistration,
+  getProviderCapabilities,
+  parseProviderRunModel,
+  getRegisteredProviders,
+  getProviderInfoList,
+  isRegisteredProvider,
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  clearRegistry,
+} from './registry';
 
 // Error
-export { UnknownProviderError } from './errors';
+export { InvalidProviderRunConfigError, UnknownProviderError } from './errors';
+
+// The shared reasoning-depth ladder is deliberately NOT re-exported here. It is
+// reachable only as `@archon/providers/effort`, a leaf with zero SDK imports, so
+// a schema or other leaf file can derive from it without dragging in this barrel
+// — which re-exports `registry.ts` and every provider SDK. See EFFORT_LADDER in
+// ./shared/effort.ts.
+
+// Shared structured-output helpers (cross-provider; the dag-executor validates
+// every provider's output_format result against the declared schema).
+export {
+  validateStructuredOutput,
+  formatSchemaErrors,
+  type StructuredValidationResult,
+} from './shared/structured-output';
 
 // Provider classes
 export { ClaudeProvider } from './claude/provider';
 export { CodexProvider } from './codex/provider';
 
 // Config parsers
-export { parseClaudeConfig, type ClaudeProviderDefaults } from './claude/config';
+export {
+  parseClaudeConfig,
+  parseClaudeSettingSources,
+  type ClaudeProviderDefaults,
+  type ParsedSettingSources,
+} from './claude/config';
 export { parseCodexConfig, type CodexProviderDefaults } from './codex/config';
 
 // Utilities (needed by consumers)
 export { resetCodexSingleton } from './codex/provider';
-export { resolveCodexBinaryPath, fileExists } from './codex/binary-resolver';
+export { loadMcpConfig, type LoadedMcpConfig } from './mcp/config';
+export {
+  resolveCodexBinaryPath,
+  resolveCodexBinaryWithSource,
+  fileExists as codexFileExists,
+  type CodexBinarySource,
+} from './codex/binary-resolver';
+export { resolveClaudeBinaryPath, fileExists as claudeFileExists } from './claude/binary-resolver';
+
+// Skills resolution
+export { claudeSkillSearchRoots, findInstalledSkillNames, skillSearchRoots } from './shared/skills';
+
+// Community providers
+export {
+  OpencodeProvider,
+  parseOpencodeConfig,
+  registerOpencodeProvider,
+  introspectOpencodeCredentials,
+  type OpencodeProviderDefaults,
+  type OpencodeCredentialIntrospection,
+  type OpencodeCredentialProvider,
+  type OpencodeAuthMethod,
+} from './community/opencode';
+export {
+  PiProvider,
+  parsePiConfig,
+  registerPiProvider,
+  listPiModels,
+  type PiProviderDefaults,
+  type PiModelInfo,
+} from './community/pi';
+// Generated Pi backend → env-var map + ambient vendors (single source for the
+// Pi runtime bridge and @archon/core's credential delivery — see #1955).
+// PI_CREDENTIAL_SPECS is intentionally NOT re-exported: its only consumer is
+// the Pi registration, which imports the generated file directly.
+export { PI_PROVIDER_ENV_VARS, PI_AMBIENT_VENDORS } from './community/pi/pi-vendor-map.generated';
+
+export {
+  CopilotProvider,
+  parseCopilotConfig,
+  registerCopilotProvider,
+  resetCopilotSingleton,
+  type CopilotProviderDefaults,
+} from './community/copilot';
+export {
+  resolveCopilotBinaryPath,
+  fileExists as copilotFileExists,
+} from './community/copilot/binary-resolver';

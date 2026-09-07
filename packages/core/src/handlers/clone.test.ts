@@ -7,9 +7,15 @@
  *   to avoid process-global mock.module pollution that would break git.test.ts
  * - Lazy logger pattern means @archon/paths mock must be set up before the module import
  */
-import { describe, test, expect, mock, beforeEach, afterAll, spyOn } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterAll, afterEach, spyOn } from 'bun:test';
+import { resolve } from 'path';
 import * as fsPromises from 'fs/promises';
 import * as gitUtils from '@archon/git';
+import type { Codebase } from '../types';
+import {
+  findCodebaseForCheckoutPath,
+  type CodebaseCheckoutResolverDeps,
+} from '../services/codebase-checkout-resolver';
 import { createMockLogger } from '../test/mocks/logger';
 
 // ── DB mocks ────────────────────────────────────────────────────────────────
@@ -29,8 +35,10 @@ const mockGetCodebaseCommands = mock(() => Promise.resolve({}));
 const mockUpdateCodebaseCommands = mock(() => Promise.resolve());
 const mockFindCodebaseByRepoUrl = mock(() => Promise.resolve(null));
 const mockFindCodebaseByDefaultCwd = mock(() => Promise.resolve(null));
+const mockListCodebases = mock(() => Promise.resolve([]));
 const mockFindCodebaseByName = mock(() => Promise.resolve(null));
 const mockUpdateCodebase = mock(() => Promise.resolve());
+const mockCreateProjectSourceSymlink = mock((): Promise<void> => Promise.resolve());
 
 mock.module('../db/codebases', () => ({
   createCodebase: mockCreateCodebase,
@@ -38,6 +46,7 @@ mock.module('../db/codebases', () => ({
   updateCodebaseCommands: mockUpdateCodebaseCommands,
   findCodebaseByRepoUrl: mockFindCodebaseByRepoUrl,
   findCodebaseByDefaultCwd: mockFindCodebaseByDefaultCwd,
+  listCodebases: mockListCodebases,
   findCodebaseByName: mockFindCodebaseByName,
   updateCodebase: mockUpdateCodebase,
 }));
@@ -48,16 +57,45 @@ const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   expandTilde: mock((p: string) => p.replace(/^~/, '/home/test')),
+  // Mirrors the real canonicalizer's contract (resolve, then realpath, falling
+  // back to the resolved path) and reads `fsPromises.realpath` at call time so
+  // the symlink test's spy still drives it.
+  canonicalizeProjectPath: mock(async (p: string) => {
+    const absolute = resolve(p.replace(/^~/, '/home/test'));
+    try {
+      return await fsPromises.realpath(absolute);
+    } catch {
+      return absolute;
+    }
+  }),
   getCommandFolderSearchPaths: mock(() => ['.archon/commands']),
   ensureProjectStructure: mock(() => Promise.resolve()),
   getProjectSourcePath: mock(
     (owner: string, repo: string) => `/home/test/.archon/workspaces/${owner}/${repo}/source`
   ),
-  createProjectSourceSymlink: mock(() => Promise.resolve()),
+  createProjectSourceSymlink: mockCreateProjectSourceSymlink,
   parseOwnerRepo: mock((name: string) => {
     const parts = name.split('/');
     return parts.length === 2 ? { owner: parts[0], repo: parts[1] } : null;
   }),
+  slugifyFolderName: mock((name: string) =>
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+  ),
+  ensureFolderProjectStructure: mock(() => Promise.resolve()),
+  getFolderProjectRoot: mock((slug: string) => `/home/test/.archon/workspaces/_folder/${slug}`),
+}));
+
+// ── config-loader mock ──────────────────────────────────────────────────────
+const mockLoadConfig = mock(() => Promise.resolve({ assistant: 'claude' }));
+mock.module('../config/config-loader', () => ({
+  loadConfig: mockLoadConfig,
+  // Nothing here calls it, but this factory replaces the module process-wide and
+  // child-isolation-resolver.ts imports it by name — omitting it breaks that
+  // import at module-eval for anything in the same batch that pulls it in.
+  loadRepoConfig: mock(() => Promise.resolve(null)),
 }));
 
 // ── utils/commands mock ─────────────────────────────────────────────────────
@@ -67,12 +105,15 @@ mock.module('../utils/commands', () => ({
 }));
 
 // ── Import module under test AFTER mocks are registered ────────────────────
-import { cloneRepository, registerRepository } from './clone';
+import { cloneRepository, registerRepository, registerFolder } from './clone';
 
 // ── Spies for fs/promises and @archon/git ──────────────────────────────────
 let spyFsAccess: ReturnType<typeof spyOn>;
 let spyFsRm: ReturnType<typeof spyOn>;
+let spyFsStat: ReturnType<typeof spyOn>;
+let spyFsRealpath: ReturnType<typeof spyOn>;
 let spyExecFileAsync: ReturnType<typeof spyOn>;
+let spyGetCanonicalRepoPath: ReturnType<typeof spyOn>;
 
 function setupSpies(): void {
   // Default: .git does NOT exist (no pre-existing clone)
@@ -80,16 +121,31 @@ function setupSpies(): void {
     Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
   );
   spyFsRm = spyOn(fsPromises, 'rm').mockResolvedValue(undefined);
+  // Default: stat reports a directory (registerFolder happy path)
+  spyFsStat = spyOn(fsPromises, 'stat').mockResolvedValue({
+    isDirectory: () => true,
+  } as Awaited<ReturnType<typeof fsPromises.stat>>);
+  // Default: realpath is identity (no symlink to resolve) — the symlink
+  // canonicalization test overrides this to return a distinct real path.
+  spyFsRealpath = spyOn(fsPromises, 'realpath').mockImplementation(((p: string) =>
+    Promise.resolve(p)) as unknown as typeof fsPromises.realpath);
   spyExecFileAsync = spyOn(gitUtils, 'execFileAsync').mockResolvedValue({
     stdout: '',
     stderr: '',
   });
+  spyGetCanonicalRepoPath = spyOn(gitUtils, 'getCanonicalRepoPath').mockImplementation(
+    (path: string): ReturnType<typeof gitUtils.getCanonicalRepoPath> =>
+      Promise.resolve(gitUtils.toRepoPath(path))
+  );
 }
 
 function restoreSpies(): void {
   spyFsAccess?.mockRestore();
   spyFsRm?.mockRestore();
+  spyFsRealpath?.mockRestore();
+  spyFsStat?.mockRestore();
   spyExecFileAsync?.mockRestore();
+  spyGetCanonicalRepoPath?.mockRestore();
 }
 
 function clearMocks(): void {
@@ -102,7 +158,10 @@ function clearMocks(): void {
   mockFindCodebaseByDefaultCwd.mockReset();
   mockFindCodebaseByName.mockReset();
   mockUpdateCodebase.mockReset();
+  mockCreateProjectSourceSymlink.mockClear();
   mockFindMarkdownFilesRecursive.mockReset();
+  mockLoadConfig.mockReset();
+  mockLoadConfig.mockResolvedValue({ assistant: 'claude' });
   mockLogger.info.mockClear();
   mockLogger.debug.mockClear();
   mockLogger.warn.mockClear();
@@ -131,6 +190,7 @@ function makeCodebase(
     name: string;
     repository_url: string | null;
     default_cwd: string;
+    default_branch: string | null;
     ai_assistant_type: string;
   }> = {}
 ): object {
@@ -139,13 +199,99 @@ function makeCodebase(
     name: 'owner/repo',
     repository_url: 'https://github.com/owner/repo',
     default_cwd: '/home/test/.archon/workspaces/owner/repo/source',
+    default_branch: null,
     ai_assistant_type: 'claude',
+    kind: 'repo',
     commands: {},
     created_at: new Date(),
     updated_at: new Date(),
     ...overrides,
   };
 }
+
+function makeResolverDeps(
+  overrides: Partial<CodebaseCheckoutResolverDeps> = {}
+): CodebaseCheckoutResolverDeps {
+  return {
+    findCodebaseByDefaultCwd: async () => null,
+    listCodebases: async () => [],
+    getCanonicalRepoPath: async path => path,
+    getGitCheckoutIdentity: async path => ({
+      gitDir: `${path}/.git`,
+      commonGitDir: `${path}/.git`,
+      linkedWorktree: false,
+    }),
+    ...overrides,
+  };
+}
+
+describe('findCodebaseForCheckoutPath', () => {
+  const cwd = '/workspace/external-linked';
+  const commonGitDir = '/metadata/repository';
+
+  function externalLinkedError(): gitUtils.CanonicalRepoPathUnavailableError {
+    return new gitUtils.CanonicalRepoPathUnavailableError(cwd, commonGitDir);
+  }
+
+  test('matches an external linked worktree to its uniquely registered Git repository', async () => {
+    const registered = makeCodebase({ default_cwd: '/workspace/primary' }) as Codebase;
+    const separateClone = makeCodebase({
+      id: 'separate-clone',
+      default_cwd: '/workspace/separate-clone',
+    }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [registered, separateClone],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : `${path}/.git`,
+        commonGitDir:
+          path === separateClone.default_cwd ? '/metadata/separate-clone' : commonGitDir,
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).resolves.toBe(registered);
+  });
+
+  test('does not conflate a separate clone with the registered repository', async () => {
+    const registered = makeCodebase({ default_cwd: '/workspace/primary' }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [registered],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : '/other/clone/.git',
+        commonGitDir: path === cwd ? commonGitDir : '/other/clone/.git',
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).resolves.toBeNull();
+  });
+
+  test('rejects ambiguous registrations sharing one external Git directory', async () => {
+    const first = makeCodebase({ id: 'first', default_cwd: '/workspace/first' }) as Codebase;
+    const second = makeCodebase({ id: 'second', default_cwd: '/workspace/second' }) as Codebase;
+    const deps = makeResolverDeps({
+      getCanonicalRepoPath: async () => {
+        throw externalLinkedError();
+      },
+      listCodebases: async () => [first, second],
+      getGitCheckoutIdentity: async path => ({
+        gitDir: path === cwd ? `${commonGitDir}/worktrees/linked` : commonGitDir,
+        commonGitDir,
+        linkedWorktree: path === cwd,
+      }),
+    });
+
+    await expect(findCodebaseForCheckoutPath(cwd, deps)).rejects.toThrow(
+      'matches multiple registered codebases'
+    );
+  });
+});
 
 // ────────────────────────────────────────────────────────────────────────────
 describe('cloneRepository', () => {
@@ -154,6 +300,8 @@ describe('cloneRepository', () => {
     restoreSpies();
     setupSpies();
     delete process.env.GH_TOKEN;
+    delete process.env.GITLAB_TOKEN;
+    delete process.env.GITEA_TOKEN;
   });
 
   // ── URL normalization / happy-path cloning ─────────────────────────────
@@ -249,6 +397,40 @@ describe('cloneRepository', () => {
 
       expect(result.name).toBe('owner/repo');
     });
+
+    test('converts SSH URL with custom host alias to HTTPS', async () => {
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'owner/repo',
+          repository_url: 'https://gh-work/owner/repo',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('git@gh-work:owner/repo.git');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).toContain('https://gh-work/owner/repo');
+      expect(cloneCall?.[1]?.[1]).not.toContain('git@');
+    });
+
+    test('converts SSH URL with non-github host to HTTPS', async () => {
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'team/project',
+          repository_url: 'https://gitlab.example.com/team/project',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('git@gitlab.example.com:team/project.git');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).toContain('https://gitlab.example.com/team/project');
+      expect(cloneCall?.[1]?.[1]).not.toContain('git@');
+    });
   });
 
   // ── GH_TOKEN authentication ────────────────────────────────────────────
@@ -272,7 +454,8 @@ describe('cloneRepository', () => {
       expect(cloneCall?.[1]?.[1]).toContain('ghp_testtoken123@github.com');
     });
 
-    test('does NOT inject GH_TOKEN into non-github URLs', async () => {
+    test('does NOT inject GH_TOKEN into non-github URLs when no forge token set', async () => {
+      delete process.env.GITLAB_TOKEN;
       mockCreateCodebase.mockResolvedValueOnce(
         makeCodebase({
           name: 'owner/repo',
@@ -280,7 +463,6 @@ describe('cloneRepository', () => {
         }) as ReturnType<typeof makeCodebase>
       );
 
-      // Override getProjectSourcePath for gitlab
       await cloneRepository('https://gitlab.com/owner/repo');
 
       const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
@@ -298,6 +480,231 @@ describe('cloneRepository', () => {
         args => args[0] === 'git' && args[1]?.[0] === 'clone'
       );
       expect(cloneCall?.[1]?.[1]).toContain('ghp_testtoken123@github.com');
+    });
+  });
+
+  // ── Multi-forge authentication ────────────────────────────────────────
+  describe('multi-forge authentication', () => {
+    afterEach(() => {
+      delete process.env.GITLAB_TOKEN;
+      delete process.env.GITEA_TOKEN;
+    });
+
+    test('injects GITLAB_TOKEN with oauth2: scheme for gitlab.com URLs', async () => {
+      process.env.GITLAB_TOKEN = 'glpat-testtoken456';
+      delete process.env.GH_TOKEN;
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'owner/repo',
+          repository_url: 'https://gitlab.com/owner/repo',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://gitlab.com/owner/repo');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).toBe('https://oauth2:glpat-testtoken456@gitlab.com/owner/repo');
+      delete process.env.GITLAB_TOKEN;
+    });
+
+    test('injects GITLAB_TOKEN for self-hosted GitLab URLs', async () => {
+      process.env.GITLAB_TOKEN = 'glpat-selfhosted';
+      delete process.env.GH_TOKEN;
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'owner/repo',
+          repository_url: 'https://gitlab.mycompany.com/owner/repo',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://gitlab.mycompany.com/owner/repo');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).toBe(
+        'https://oauth2:glpat-selfhosted@gitlab.mycompany.com/owner/repo'
+      );
+      delete process.env.GITLAB_TOKEN;
+    });
+
+    test('injects GITEA_TOKEN for Gitea URLs', async () => {
+      process.env.GITEA_TOKEN = 'gitea-token-789';
+      delete process.env.GH_TOKEN;
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'owner/repo',
+          repository_url: 'https://gitea.myorg.com/owner/repo',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://gitea.myorg.com/owner/repo');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).toBe('https://gitea-token-789@gitea.myorg.com/owner/repo');
+      delete process.env.GITEA_TOKEN;
+    });
+
+    test('injects GITEA_TOKEN for Forgejo URLs', async () => {
+      process.env.GITEA_TOKEN = 'forgejo-token';
+      delete process.env.GH_TOKEN;
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'owner/repo',
+          repository_url: 'https://forgejo.example.org/owner/repo',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://forgejo.example.org/owner/repo');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).toBe('https://forgejo-token@forgejo.example.org/owner/repo');
+      delete process.env.GITEA_TOKEN;
+    });
+
+    test('does not inject auth for unknown forge without token', async () => {
+      delete process.env.GH_TOKEN;
+      delete process.env.GITLAB_TOKEN;
+      delete process.env.GITEA_TOKEN;
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'owner/repo',
+          repository_url: 'https://bitbucket.org/owner/repo',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://bitbucket.org/owner/repo');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).toBe('https://bitbucket.org/owner/repo');
+    });
+
+    test('does not leak token when forge name appears only in URL path', async () => {
+      process.env.GITLAB_TOKEN = 'glpat-shouldnotleak';
+      delete process.env.GH_TOKEN;
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({
+          name: 'owner/repo',
+          repository_url: 'https://evil.example.com/gitlab/mirror',
+        }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://evil.example.com/gitlab/mirror');
+
+      const cloneCall = (spyExecFileAsync.mock.calls as string[][]).find(
+        args => args[0] === 'git' && args[1]?.[0] === 'clone'
+      );
+      expect(cloneCall?.[1]?.[1]).not.toContain('glpat-shouldnotleak');
+      delete process.env.GITLAB_TOKEN;
+    });
+  });
+
+  // ── GIT_TERMINAL_PROMPT fail-fast (salvaged from PR #1404, credit @mlnchk) ─
+  describe('fail-fast env', () => {
+    test('passes GIT_TERMINAL_PROMPT=0 to the git clone subprocess', async () => {
+      mockCreateCodebase.mockResolvedValueOnce(makeCodebase() as ReturnType<typeof makeCodebase>);
+
+      await cloneRepository('https://github.com/owner/repo');
+
+      const cloneCall = (
+        spyExecFileAsync.mock.calls as [string, string[], { env?: NodeJS.ProcessEnv }][]
+      ).find(args => args[0] === 'git' && args[1]?.[0] === 'clone');
+      expect(cloneCall).toBeDefined();
+      const env = cloneCall?.[2]?.env ?? {};
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      // The rest of the environment must be inherited, not stripped. On
+      // Windows the key can be 'Path' — spreading process.env keeps the
+      // original casing — so locate the path key case-insensitively.
+      const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path');
+      expect(pathKey).toBeDefined();
+      expect(env[pathKey!]).toBe(process.env[pathKey!]);
+    });
+  });
+
+  // ── resolveForgeAuth unit tests ──────────────────────────────────────────
+  describe('resolveForgeAuth', () => {
+    const { resolveForgeAuth } = require('./clone');
+
+    test('returns GH_TOKEN for github.com', () => {
+      process.env.GH_TOKEN = 'ghp_abc';
+      const result = resolveForgeAuth('https://github.com/owner/repo');
+      expect(result).toEqual({ token: 'ghp_abc', scheme: '' });
+      delete process.env.GH_TOKEN;
+    });
+
+    test('returns GITLAB_TOKEN with oauth2: scheme for gitlab.com', () => {
+      process.env.GITLAB_TOKEN = 'glpat-xyz';
+      const result = resolveForgeAuth('https://gitlab.com/owner/repo');
+      expect(result).toEqual({ token: 'glpat-xyz', scheme: 'oauth2:' });
+      delete process.env.GITLAB_TOKEN;
+    });
+
+    test('returns undefined token when env var is not set', () => {
+      delete process.env.GH_TOKEN;
+      const result = resolveForgeAuth('https://github.com/owner/repo');
+      expect(result).toEqual({ token: undefined, scheme: '' });
+    });
+
+    test('returns empty for unknown forge', () => {
+      const result = resolveForgeAuth('https://bitbucket.org/owner/repo');
+      expect(result).toEqual({ token: undefined, scheme: '' });
+    });
+
+    test('resolves GH_TOKEN for bare host/path form without protocol', () => {
+      process.env.GH_TOKEN = 'ghp_bare';
+      const result = resolveForgeAuth('github.com/owner/repo');
+      expect(result).toEqual({ token: 'ghp_bare', scheme: '' });
+      delete process.env.GH_TOKEN;
+    });
+
+    test('does not match forge name in URL path (security)', () => {
+      process.env.GITLAB_TOKEN = 'glpat-leaked';
+      const result = resolveForgeAuth('https://evil.example.com/gitlab/mirror');
+      expect(result).toEqual({ token: undefined, scheme: '' });
+      delete process.env.GITLAB_TOKEN;
+    });
+
+    test('returns GITEA_TOKEN when GITEA_URL hostname matches clone URL', () => {
+      process.env.GITEA_URL = 'https://git.example.com';
+      process.env.GITEA_TOKEN = 'gitea_tok_123';
+      const result = resolveForgeAuth('https://git.example.com/group/app.git');
+      expect(result).toEqual({ token: 'gitea_tok_123', scheme: '' });
+      delete process.env.GITEA_URL;
+      delete process.env.GITEA_TOKEN;
+    });
+
+    test('returns GITLAB_TOKEN with oauth2: scheme when GITLAB_URL hostname matches', () => {
+      process.env.GITLAB_URL = 'https://code.mycompany.com';
+      process.env.GITLAB_TOKEN = 'glpat-corp';
+      const result = resolveForgeAuth('https://code.mycompany.com/team/project');
+      expect(result).toEqual({ token: 'glpat-corp', scheme: 'oauth2:' });
+      delete process.env.GITLAB_URL;
+      delete process.env.GITLAB_TOKEN;
+    });
+
+    test('does not leak GITEA_TOKEN when GITEA_URL is set but hostname differs', () => {
+      process.env.GITEA_URL = 'https://git.example.com';
+      process.env.GITEA_TOKEN = 'gitea_tok_secret';
+      const result = resolveForgeAuth('https://evil.example.com/repo');
+      expect(result).toEqual({ token: undefined, scheme: '' });
+      delete process.env.GITEA_URL;
+      delete process.env.GITEA_TOKEN;
+    });
+
+    test('URL fallback does not activate when token env var is unset', () => {
+      process.env.GITEA_URL = 'https://git.example.com';
+      delete process.env.GITEA_TOKEN;
+      const result = resolveForgeAuth('https://git.example.com/group/app');
+      expect(result).toEqual({ token: undefined, scheme: '' });
+      delete process.env.GITEA_URL;
     });
   });
 
@@ -541,6 +948,32 @@ describe('cloneRepository', () => {
       expect(createCall[0].ai_assistant_type).toBe('claude');
     });
 
+    test('uses configured provider when no .codex or .claude folder exists', async () => {
+      mockLoadConfig.mockResolvedValue({ assistant: 'pi' });
+      spyFsAccess.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({ ai_assistant_type: 'pi' }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://github.com/owner/repo');
+
+      const createCall = mockCreateCodebase.mock.calls[0] as [{ ai_assistant_type: string }];
+      expect(createCall[0].ai_assistant_type).toBe('pi');
+    });
+
+    test('falls back to claude when loadConfig fails', async () => {
+      mockLoadConfig.mockRejectedValue(new Error('config load failed'));
+      spyFsAccess.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockCreateCodebase.mockResolvedValueOnce(
+        makeCodebase({ ai_assistant_type: 'claude' }) as ReturnType<typeof makeCodebase>
+      );
+
+      await cloneRepository('https://github.com/owner/repo');
+
+      const createCall = mockCreateCodebase.mock.calls[0] as [{ ai_assistant_type: string }];
+      expect(createCall[0].ai_assistant_type).toBe('claude');
+    });
+
     test('detects claude assistant when .claude folder exists but .codex does not', async () => {
       spyFsAccess.mockImplementation((path: string) => {
         // .codex → ENOENT, .claude → exists, .git → ENOENT, commands → ENOENT
@@ -572,7 +1005,9 @@ describe('registerRepository', () => {
   // ── Happy path ─────────────────────────────────────────────────────────
   test('registers a valid local git repo not yet in DB', async () => {
     spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
-      if (args.includes('rev-parse')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('--git-dir')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('--abbrev-ref'))
+        return Promise.resolve({ stdout: 'develop\n', stderr: '' });
       if (args.includes('get-url'))
         return Promise.resolve({ stdout: 'https://github.com/owner/repo', stderr: '' });
       return Promise.resolve({ stdout: '', stderr: '' });
@@ -588,6 +1023,31 @@ describe('registerRepository', () => {
 
     expect(result.alreadyExisted).toBe(false);
     expect(result.name).toBe('owner/repo');
+    expect(mockCreateCodebase).toHaveBeenCalledWith(
+      expect.objectContaining({ default_branch: 'develop' })
+    );
+  });
+
+  test('stores null default_branch when checkout is detached', async () => {
+    spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (args.includes('--git-dir')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('--abbrev-ref')) return Promise.resolve({ stdout: 'HEAD\n', stderr: '' });
+      if (args.includes('get-url'))
+        return Promise.resolve({ stdout: 'https://github.com/owner/repo', stderr: '' });
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockCreateCodebase.mockResolvedValueOnce(
+      makeCodebase({ name: 'owner/repo', default_cwd: '/home/user/myrepo' }) as ReturnType<
+        typeof makeCodebase
+      >
+    );
+
+    await registerRepository('/home/user/myrepo');
+
+    expect(mockCreateCodebase).toHaveBeenCalledWith(
+      expect.objectContaining({ default_branch: null })
+    );
   });
 
   test('returns existing record immediately when path already registered', async () => {
@@ -604,6 +1064,33 @@ describe('registerRepository', () => {
     expect(result.codebaseId).toBe('existing-codebase-id');
     // createCodebase should NOT be called
     expect(mockCreateCodebase.mock.calls.length).toBe(0);
+  });
+
+  test('reuses the registered primary checkout for a linked worktree', async () => {
+    spyExecFileAsync.mockResolvedValue({ stdout: '.git', stderr: '' });
+    spyGetCanonicalRepoPath.mockResolvedValueOnce(
+      gitUtils.toRepoPath('/home/user/primary-checkout')
+    );
+    const existingCodebase = makeCodebase({
+      id: 'primary-codebase-id',
+      default_cwd: '/home/user/primary-checkout',
+    });
+    mockFindCodebaseByDefaultCwd
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(existingCodebase);
+
+    const result = await registerRepository('/home/user/sibling-worktree');
+
+    expect(mockFindCodebaseByDefaultCwd).toHaveBeenNthCalledWith(1, '/home/user/sibling-worktree');
+    expect(mockFindCodebaseByDefaultCwd).toHaveBeenNthCalledWith(2, '/home/user/primary-checkout');
+    expect(result).toMatchObject({
+      alreadyExisted: true,
+      codebaseId: 'primary-codebase-id',
+      defaultCwd: '/home/user/primary-checkout',
+    });
+    expect(mockCreateProjectSourceSymlink).not.toHaveBeenCalled();
+    expect(mockCreateCodebase).not.toHaveBeenCalled();
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
   });
 
   // ── Validation ─────────────────────────────────────────────────────────
@@ -736,6 +1223,138 @@ describe('registerRepository', () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+describe('registerFolder', () => {
+  beforeEach(() => {
+    clearMocks();
+    restoreSpies();
+    setupSpies();
+  });
+
+  // ── Happy path ─────────────────────────────────────────────────────────
+  test('registers a non-git directory as a folder project (kind: folder)', async () => {
+    // resolve() the input so the expectation is portable: on Windows,
+    // resolve('/tmp/platform') is 'D:\tmp\platform' (drive-qualified), and
+    // registerFolder stores that resolved form (realpath spy is identity here).
+    const inputPath = '/tmp/platform';
+    const resolvedPath = resolve(inputPath);
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockCreateCodebase.mockResolvedValueOnce(
+      makeCodebase({
+        id: 'folder-uuid-1',
+        name: 'platform',
+        repository_url: null,
+        default_cwd: resolvedPath,
+      }) as ReturnType<typeof makeCodebase>
+    );
+
+    const result = await registerFolder(inputPath);
+
+    expect(result.alreadyExisted).toBe(false);
+    expect(result.name).toBe('platform');
+    expect(result.repositoryUrl).toBeNull();
+    expect(result.defaultBranch).toBeNull();
+    expect(result.defaultCwd).toBe(resolvedPath);
+    // No git commands were ever run
+    expect(spyExecFileAsync.mock.calls.length).toBe(0);
+    // createCodebase received kind: 'folder' and no repository_url
+    expect(mockCreateCodebase).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'platform', default_cwd: resolvedPath, kind: 'folder' })
+    );
+    const createArg = mockCreateCodebase.mock.calls[0]?.[0] as { repository_url?: unknown };
+    expect(createArg.repository_url).toBeUndefined();
+  });
+
+  test('derives name from basename when name not provided', async () => {
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockCreateCodebase.mockResolvedValueOnce(makeCodebase() as ReturnType<typeof makeCodebase>);
+
+    await registerFolder('/home/user/ops-client');
+
+    const createArg = mockCreateCodebase.mock.calls[0]?.[0] as { name: string };
+    expect(createArg.name).toBe('ops-client');
+  });
+
+  test('uses the explicit name override when provided', async () => {
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockCreateCodebase.mockResolvedValueOnce(makeCodebase() as ReturnType<typeof makeCodebase>);
+
+    await registerFolder('/home/user/ops-client', 'Acme Ops');
+
+    const createArg = mockCreateCodebase.mock.calls[0]?.[0] as { name: string };
+    expect(createArg.name).toBe('Acme Ops');
+  });
+
+  // ── Validation ─────────────────────────────────────────────────────────
+  test('throws when the path does not exist', async () => {
+    // Canonicalization is fail-safe (it returns the unresolved path), so `stat`
+    // is the existence gate. Both reject here the way the real fs does for a
+    // missing path, so the registration is refused rather than stored.
+    const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    spyFsRealpath.mockRejectedValueOnce(enoent);
+    spyFsStat.mockRejectedValueOnce(enoent);
+
+    await expect(registerFolder('/tmp/does-not-exist')).rejects.toThrow('Path does not exist');
+    expect(mockCreateCodebase.mock.calls.length).toBe(0);
+  });
+
+  // ── Symlink canonicalization (regression) ──────────────────────────────
+  test('stores the realpath-canonicalized path so symlinked roots match on lookup', async () => {
+    // Simulate macOS /tmp → /private/tmp: realpath maps the symlink to its real
+    // target. Both sides are resolve()d so the comparison inside the mock and
+    // the expectations hold on Windows too (resolve drive-qualifies the paths).
+    const symlinkPath = resolve('/tmp/platform');
+    const realPath = resolve('/private/tmp/platform');
+    spyFsRealpath.mockImplementationOnce(((p: string) =>
+      Promise.resolve(p === symlinkPath ? realPath : p)) as unknown as never);
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockCreateCodebase.mockResolvedValueOnce(
+      makeCodebase({
+        id: 'folder-uuid-1',
+        name: 'platform',
+        repository_url: null,
+        default_cwd: realPath,
+      }) as ReturnType<typeof makeCodebase>
+    );
+
+    const result = await registerFolder('/tmp/platform');
+
+    // The already-registered check and the stored default_cwd both use the REAL
+    // path, matching what process.cwd() (and thus the gate/doctor) resolves to.
+    expect(mockFindCodebaseByDefaultCwd).toHaveBeenCalledWith(realPath);
+    expect(mockCreateCodebase).toHaveBeenCalledWith(
+      expect.objectContaining({ default_cwd: realPath, kind: 'folder' })
+    );
+    expect(result.defaultCwd).toBe(realPath);
+  });
+
+  test('throws when the path is a file, not a directory', async () => {
+    spyFsStat.mockResolvedValueOnce({
+      isDirectory: () => false,
+    } as Awaited<ReturnType<typeof fsPromises.stat>>);
+
+    await expect(registerFolder('/tmp/a-file.txt')).rejects.toThrow('Path is not a directory');
+    expect(mockCreateCodebase.mock.calls.length).toBe(0);
+  });
+
+  // ── Idempotency ────────────────────────────────────────────────────────
+  test('returns the existing record when the path is already registered', async () => {
+    const existing = makeCodebase({
+      id: 'existing-folder-id',
+      name: 'platform',
+      repository_url: null,
+      default_cwd: '/tmp/platform',
+    });
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(existing);
+
+    const result = await registerFolder('/tmp/platform');
+
+    expect(result.alreadyExisted).toBe(true);
+    expect(result.codebaseId).toBe('existing-folder-id');
+    expect(mockCreateCodebase.mock.calls.length).toBe(0);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 describe('normalizeRepoUrl (via cloneRepository)', () => {
   beforeEach(() => {
     clearMocks();
@@ -819,7 +1438,9 @@ describe('name-based deduplication', () => {
       default_cwd: '/home/test/.archon/workspaces/owner/repo/source',
     });
     spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
-      if (args.includes('rev-parse')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('--git-dir')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('--abbrev-ref'))
+        return Promise.resolve({ stdout: 'develop\n', stderr: '' });
       if (args.includes('get-url'))
         return Promise.resolve({ stdout: 'https://github.com/owner/repo', stderr: '' });
       return Promise.resolve({ stdout: '', stderr: '' });
@@ -831,10 +1452,39 @@ describe('name-based deduplication', () => {
 
     // updateCodebase should be called with the local path
     expect(mockUpdateCodebase.mock.calls.length).toBe(1);
-    const updateArgs = mockUpdateCodebase.mock.calls[0] as [string, { default_cwd?: string }];
+    const updateArgs = mockUpdateCodebase.mock.calls[0] as [
+      string,
+      { default_cwd?: string; default_branch?: string | null },
+    ];
     expect(updateArgs[0]).toBe('existing-id');
     expect(updateArgs[1].default_cwd).toBe('/home/user/repo');
+    expect(updateArgs[1].default_branch).toBe('develop');
     expect(result.defaultCwd).toBe('/home/user/repo');
+    expect(result.defaultBranch).toBe('develop');
+  });
+
+  test('fills missing default_branch on existing local codebase', async () => {
+    const existingCodebase = makeCodebase({
+      id: 'existing-id',
+      name: 'owner/repo',
+      repository_url: 'https://github.com/owner/repo',
+      default_cwd: '/home/user/repo',
+      default_branch: null,
+    });
+    spyExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (args.includes('--git-dir')) return Promise.resolve({ stdout: '.git', stderr: '' });
+      if (args.includes('--abbrev-ref')) return Promise.resolve({ stdout: 'trunk\n', stderr: '' });
+      if (args.includes('get-url'))
+        return Promise.resolve({ stdout: 'https://github.com/owner/repo', stderr: '' });
+      return Promise.resolve({ stdout: '', stderr: '' });
+    });
+    mockFindCodebaseByDefaultCwd.mockResolvedValueOnce(null);
+    mockFindCodebaseByName.mockResolvedValueOnce(existingCodebase);
+
+    const result = await registerRepository('/home/user/repo');
+
+    expect(mockUpdateCodebase).toHaveBeenCalledWith('existing-id', { default_branch: 'trunk' });
+    expect(result.defaultBranch).toBe('trunk');
   });
 
   test('should not downgrade default_cwd from local to managed path', async () => {
