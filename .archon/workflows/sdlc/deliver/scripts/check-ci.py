@@ -37,6 +37,10 @@ def checks() -> list[dict]:
     )
     if proc.returncode != 0 and "no checks reported" in (proc.stdout + proc.stderr).lower():
         return []
+    if proc.returncode != 0 and "unknown flag" in proc.stderr:
+        # gh < 2.51 has no `pr checks --json`; its non-tty output is stable
+        # TSV (name, bucket, duration, url) with the same bucket vocabulary.
+        return checks_tsv()
     # Non-zero with data still parses: gh exits 1 when checks failed.
     try:
         parsed = json.loads(proc.stdout)
@@ -49,6 +53,24 @@ def checks() -> list[dict]:
         print(f"check-ci: unexpected check payload shape: {proc.stdout[:200]}", file=sys.stderr)
         sys.exit(1)
     return parsed
+
+
+def checks_tsv() -> list[dict]:
+    proc = subprocess.run(
+        ["gh", "pr", "checks"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0 and "no checks reported" in (proc.stdout + proc.stderr).lower():
+        return []
+    rows = [line.split("\t") for line in proc.stdout.splitlines() if "\t" in line]
+    if not rows:
+        print(f"check-ci: could not read check state: {proc.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    # Old gh has no separate cancel bucket (cancelled lands in fail); every
+    # bucket other than pass/skipping/pending fails the node below, so the
+    # R4 cancelled-is-not-green rule still holds.
+    return [{"name": r[0], "bucket": r[1]} for r in rows]
 
 
 def repo_has_active_workflows() -> bool | None:
