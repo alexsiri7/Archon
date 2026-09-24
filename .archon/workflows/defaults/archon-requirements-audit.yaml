@@ -156,7 +156,7 @@ nodes:
       End with a tally: counts per verdict, plus the list of deprecated ids skipped.
     depends_on: [load-requirements, scan-structure]
     context: fresh
-    model: claude-fable-5[1m]
+    model: claude-fable-5-1
     denied_tools: [Write, Edit]
 
   - id: trace-reverse
@@ -200,7 +200,7 @@ nodes:
       (is the requirements file tracking reality?).
     depends_on: [load-requirements, scan-structure]
     context: fresh
-    model: claude-fable-5[1m]
+    model: claude-fable-5-1
     denied_tools: [Write, Edit]
 
   # ═══════════════════════════════════════════════════════════════
@@ -267,7 +267,7 @@ nodes:
     depends_on: [trace-forward, trace-reverse]
     trigger_rule: one_success
     context: fresh
-    model: claude-fable-5[1m]
+    model: claude-fable-5-1
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 5: VALIDATE the regenerated coverage file

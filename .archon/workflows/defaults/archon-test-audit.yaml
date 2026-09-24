@@ -211,7 +211,7 @@ nodes:
       Numbered plan. Be specific — the implement node will follow this literally.
     depends_on: [coverage-gap-agent, flaky-test-agent]
     context: fresh
-    model: claude-fable-5[1m]
+    model: claude-fable-5-1
     allowed_tools: [Read]
 
   # ═══════════════════════════════════════════════════════════════
