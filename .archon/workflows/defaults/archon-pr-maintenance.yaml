@@ -6,7 +6,8 @@ description: |
   NOT for: Creating new PRs, reviewing code, fixing specific issues from scratch.
 
   Picks the highest-priority open PR needing attention (or a specific PR if given),
-  rebases it, resolves conflicts, fixes CI failures, and enables auto-merge.
+  rebases it, resolves conflicts and fixes CI failures. It never merges:
+  pr-maintenance-cron.sh merges CLEAN PRs after its trust and scope checks.
   Designed to be run on a cron — one PR per run, zero AI cost if nothing to do.
 
 provider: claude
@@ -144,24 +145,15 @@ nodes:
       git push --force-with-lease
       ```
 
-      ### Step 4: Enable auto-merge
+      ### Step 4: Do not merge
 
-      ```bash
-      gh pr merge $find-pr.output --squash --auto --delete-branch 2>&1 || \
-        echo "Auto-merge not available"
-      ```
-
-      If auto-merge is not available (no branch protection rules), check CI status
-      and merge directly once passing:
-      ```bash
-      gh pr checks $find-pr.output --watch --fail-fast 2>&1 || true
-      gh pr merge $find-pr.output --squash --delete-branch 2>&1 || \
-        echo "Could not merge — may need manual review"
-      ```
+      Never merge the PR and never enable auto-merge (`gh pr merge` in any
+      form). pr-maintenance-cron.sh merges it once it is CLEAN, after its
+      trust and scope checks (ops/cron/lib/trust.sh in interstellarai.net).
 
       ### Step 5: Report result
 
-      Output a brief summary: PR number, what you did, whether it merged or has auto-merge enabled.
+      Output a brief summary: PR number, what you did, and the PR's CI state.
 
       ## Important
 
