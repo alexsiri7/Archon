@@ -1203,9 +1203,11 @@ describe('WorktreeProvider against real git', () => {
   test('marker write failure rolls back the locked setup and retains trust', async () => {
     const config = process.env.GIT_CONFIG_GLOBAL;
     if (!config) throw new Error('Scratch global config missing');
+    // Fork: git 2.43 (Ubuntu 24.04's) checks the local remote by its `.git` path when
+    // `ls-remote` runs upload-pack, so the trust this test seeds names that path too.
     await writeFile(
       config,
-      `[safe]\n directory = /workspace/other\n directory = ${JSON.stringify(repoPath)}\n`
+      `[safe]\n directory = /workspace/other\n directory = ${JSON.stringify(repoPath)}\n directory = ${JSON.stringify(join(repoPath, '.git'))}\n`
     );
     await git(repoPath, 'remote', 'add', 'origin', repoPath);
     await writeFile(
@@ -1235,7 +1237,7 @@ describe('WorktreeProvider against real git', () => {
     expect(await registeredWorktrees()).not.toContain(resolve(path));
     expect(
       (await git(root, 'config', '--global', '--get-all', 'safe.directory')).trim().split('\n')
-    ).toEqual(['/workspace/other', repoPath, path]);
+    ).toEqual(['/workspace/other', repoPath, join(repoPath, '.git'), path]);
   });
 
   describe('a new-branch request naming a branch that already exists', () => {

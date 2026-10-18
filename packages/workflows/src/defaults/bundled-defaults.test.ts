@@ -56,12 +56,18 @@ describe('bundled-defaults', () => {
   describe('fresh install', () => {
     // A binary reads the embedded records; a source install reads the indexed tree.
     // Both must offer exactly the sdlc pack, so neither can still ship a flat default.
-    it('ships only the sdlc pack, in the binary and from source', async () => {
+    // Fork (alexsiri7/Archon): the `factory` pack ships beside sdlc — the workflows the
+    // interstellarai.net ops crons launch that upstream stopped shipping in v0.12.0.
+    const SHIPPED_PACKS = new Set(['sdlc', 'factory']);
+
+    it('ships only the sdlc and factory packs, in the binary and from source', async () => {
       const embedded = Object.keys(BUNDLED_WORKFLOWS).sort();
-      expect(embedded.filter(name => BUNDLED_WORKFLOW_OWNERS[name]?.pack !== 'sdlc')).toEqual([]);
+      expect(
+        embedded.filter(name => !SHIPPED_PACKS.has(BUNDLED_WORKFLOW_OWNERS[name]?.pack ?? ''))
+      ).toEqual([]);
       expect(
         Object.keys(BUNDLED_COMMANDS).filter(
-          name => parsePackagedResourceReference(name)?.owner.pack !== 'sdlc'
+          name => !SHIPPED_PACKS.has(parsePackagedResourceReference(name)?.owner.pack ?? '')
         )
       ).toEqual([]);
 
@@ -69,7 +75,7 @@ describe('bundled-defaults', () => {
       const fromSource = (sources ?? []).flatMap(file =>
         file.kind === 'workflow' ? [{ name: file.name, pack: file.owner.pack }] : []
       );
-      expect(fromSource.filter(file => file.pack !== 'sdlc')).toEqual([]);
+      expect(fromSource.filter(file => !SHIPPED_PACKS.has(file.pack))).toEqual([]);
       expect(fromSource.map(file => file.name).sort()).toEqual(embedded);
     });
 
