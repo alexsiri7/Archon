@@ -594,6 +594,13 @@ describe('bundled-defaults', () => {
       expect(parsed.workflow.inputs?.pr_head).toBeUndefined();
       const scope = parsed.workflow.nodes.find(node => node.id === 'scope');
       expect(scope?.depends_on).toBeUndefined();
+      // A structured-output miss (route's prose turn, scope's mistyped pointer) gets a
+      // fresh attempt instead of failing the delivery; only `on_error: all` retries
+      // output_contract failures.
+      expect(scope).toMatchObject({ retry: { max_attempts: 1, on_error: 'all' } });
+      expect(parsed.workflow.nodes.find(node => node.id === 'route')).toMatchObject({
+        retry: { max_attempts: 2, on_error: 'all' },
+      });
       expect(parsed.workflow.nodes.find(node => node.id === 'mode')).toMatchObject({
         depends_on: ['scope'],
         when: '$scope.output.head_matches == true',

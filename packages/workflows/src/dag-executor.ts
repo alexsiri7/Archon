@@ -2401,11 +2401,13 @@ function observeNodeCheckout(ctx: RunLayersContext): Promise<CheckoutObservation
 
 function aiNodeEnvironment(
   ctx: RunLayersContext,
-  execution: NodeExecutionRecord
+  execution: NodeExecutionRecord,
+  node?: DagNode
 ): Record<string, string> {
   return buildAiNodeEnvironment(
     execution,
-    ctx.execContext.kind === 'host' ? process.env.ARCHON_CLI_COMMAND : undefined
+    ctx.execContext.kind === 'host' ? process.env.ARCHON_CLI_COMMAND : undefined,
+    node !== undefined && isCheckoutGuarded(node)
   );
 }
 
@@ -2670,7 +2672,7 @@ async function executeNodeInternal(
   const shouldForkSession = resumeSessionId !== undefined && resumeIntent !== 'owner-continuation';
   const nodeOptionsWithAbort: SendQueryOptions | undefined = {
     ...nodeOptions,
-    env: { ...nodeOptions?.env, ...aiNodeEnvironment(ctx, execution) },
+    env: { ...nodeOptions?.env, ...aiNodeEnvironment(ctx, execution, node) },
     ...(nodeMcp.kind === 'load' || nodeMcp.kind === 'missing'
       ? { nodeConfig: { ...nodeOptions?.nodeConfig, mcp: nodeMcp.path } }
       : {}),

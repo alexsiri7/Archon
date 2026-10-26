@@ -80,12 +80,19 @@ function nodeExecutionEnvValue(execution: NodeExecutionIdentity): string {
  */
 export function buildAiNodeEnvironment(
   execution: NodeExecutionIdentity,
-  cliCommand: string | undefined
+  cliCommand: string | undefined,
+  readOnlyCheckout = false
 ): Record<string, string> {
   return {
     WORKFLOW_ID: execution.runId,
     ARCHON_NODE_EXECUTION: nodeExecutionEnvValue(execution),
     ARCHON_CLI_COMMAND: cliCommand ?? '',
+    // A `mutates_checkout: false` agent may still run the project's tests to falsify a
+    // finding, and CPython writes `__pycache__/` beside every module it imports. In a
+    // repository that does not gitignore those caches, that byproduct alone failed the
+    // node's checkout assertion and the whole run. Not writing them keeps the assertion
+    // about the agent's own edits; it still fails a node that changes a file.
+    ...(readOnlyCheckout ? { PYTHONDONTWRITEBYTECODE: '1' } : {}),
   };
 }
 

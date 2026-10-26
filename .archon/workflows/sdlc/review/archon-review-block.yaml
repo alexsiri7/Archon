@@ -142,10 +142,14 @@ nodes:
           required: [delivers, parts]
       required: [continuation, light, head, cursor, risks, execution, seams, code, tests, errors, docs, part]
 
+  # A declaration the engine refuses (a mistyped run id in the report pointer, say)
+  # gets one fresh attempt: the agent transcribes, it decides nothing a rerun could
+  # change. The checkout assertion sits outside retry, so an edit still fails at once.
   - id: scope
     command: review-scope
     context: fresh
     mutates_checkout: false
+    retry: { max_attempts: 1, on_error: all }
     output_format:
       type: object
       properties:
@@ -181,11 +185,16 @@ nodes:
   # summary and the work order and answers, with seams on by default. Every round
   # but a light one routes; on a continuation route adds to the code lens every lens
   # whose finding the previous report leaves open or whose area the delta touches.
+  # The small model sometimes ends its turn in prose that claims it already declared
+  # (about 3% of rounds), and an enforced provider gets no reask. That miss failed the
+  # whole delivery, so it gets fresh attempts. No model fallback exists for a schema
+  # miss: a provider's fallbackModel covers an unavailable model, not this.
   - id: route
     command: route-review
     model: small
     context: fresh
     mutates_checkout: false
+    retry: { max_attempts: 2, on_error: all }
     depends_on: [mode, scope]
     when: "$scope.output.head_matches == true && $mode.output.light == false"
     output_format:

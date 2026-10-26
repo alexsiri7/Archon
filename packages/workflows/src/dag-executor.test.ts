@@ -19807,6 +19807,19 @@ describe('executeDagWorkflow -- env var injection', () => {
       expect(execution).toHaveProperty('attempt');
     });
 
+    it('a mutates_checkout: false agent node runs with Python bytecode caches off', async () => {
+      const { env } = await runIdentityEnv(
+        {
+          id: 'review',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'Review.' },
+          mutates_checkout: false,
+        },
+        {}
+      );
+      expect(env.PYTHONDONTWRITEBYTECODE).toBe('1');
+    });
+
     it('project env cannot shadow the identity of a prompt: node', async () => {
       const { env, execution } = await runIdentityEnv(
         { id: 'notes', kind: 'agent', source: { kind: 'inline', prompt: 'Keep notes.' } },
