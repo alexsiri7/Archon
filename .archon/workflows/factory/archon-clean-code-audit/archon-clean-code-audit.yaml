@@ -1,0 +1,204 @@
+name: archon-clean-code-audit
+description: |
+  Use when: the nightly sweep runs Lachesis's `clean-code` audit kind, or a user asks for a
+  clean-code review of a repository.
+  Triggers: "clean code audit", "clean-code audit", "code quality audit".
+  Does: measures the codebase (any language) -> reviews it against Robert C. Martin's Clean Code
+        standards, with business logic kept apart from I/O, frameworks and delivery -> files at most
+        five refactor issues labelled `clean-code`, one per coherent refactor, for the factory to
+        implement through its normal issue pipeline.
+  NOT for: making the changes itself (the issues do that), security, test coverage, architecture
+           metrics (other audit kinds).
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: MEASURE — language-agnostic hotspots
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scan
+    bash: |
+      EXCL='-not -path */node_modules/* -not -path */.git/* -not -path */dist/* -not -path */build/* -not -path */.venv/* -not -path */__pycache__/* -not -path */target/* -not -path */.dart_tool/* -not -path */vendor/*'
+      SRC=$(find . -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.mjs' -o -name '*.py' -o -name '*.rs' -o -name '*.dart' -o -name '*.go' -o -name '*.kt' \) $EXCL -not -name '*.d.ts' -not -name '*.min.js' 2>/dev/null)
+      if [ -z "$SRC" ]; then echo "No source files found."; exit 0; fi
+
+      echo "=== LARGEST SOURCE FILES (lines, top 25) ==="
+      echo "$SRC" | xargs wc -l 2>/dev/null | grep -v ' total$' | sort -rn | head -25
+
+      echo ""
+      echo "=== LONGEST FUNCTIONS (approximate, top 25) ==="
+      # A function starts at a def/function/fn/arrow line; its length is the gap to the next start
+      # in the same file. Crude, but language-agnostic and good enough to point the reviewer.
+      echo "$SRC" | while read -r f; do
+        grep -nE '^\s*(export\s+)?(async\s+)?(function\s|def\s|fn\s|pub\s+fn\s|func\s)|^\s*(export\s+)?(const|let)\s+\w+\s*=\s*(async\s*)?\(' "$f" 2>/dev/null \
+          | awk -F: -v f="$f" -v total="$(wc -l < "$f")" '
+              { if (prev) print ($1 - prevline) "\t" f ":" prevline "\t" prevname; prev=1; prevline=$1; prevname=$2 }
+              END { if (prev) print (total - prevline + 1) "\t" f ":" prevline "\t" prevname }'
+      done | sort -rn | head -25 | cut -c1-200
+
+      echo ""
+      echo "=== TESTS ==="
+      echo "test files: $(find . -type f \( -name '*.test.*' -o -name '*.spec.*' -o -name 'test_*.py' -o -name '*_test.*' \) $EXCL 2>/dev/null | wc -l)"
+      echo "source files: $(echo "$SRC" | wc -l)"
+
+      echo ""
+      echo "=== PROJECT GUIDANCE FILES ==="
+      ls -1 CLAUDE.md AGENTS.md docs/ARCHITECTURE.md ARCHITECTURE.md docs/design/STYLE.md 2>/dev/null || true
+    timeout: 120000
+
+  - id: open-issues
+    bash: |
+      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      echo "Open clean-code issues in $ORIGIN_REPO (do not file duplicates of these):"
+      gh issue list --repo "$ORIGIN_REPO" --label clean-code --state open --limit 50 \
+        --json number,title --jq '.[] | "#\(.number) \(.title)"' 2>/dev/null || echo "(none, or the label does not exist yet)"
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: REVIEW — read-only; writes findings JSON to the artifacts dir
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review
+    prompt: |
+      You are auditing this repository against Robert C. Martin's Clean Code standards. You do NOT
+      change code. You produce at most five findings, each one a coherent refactor the factory can
+      implement as one pull request.
+
+      ## Metrics
+
+      $scan.output
+
+      ## Already filed
+
+      $open-issues.output
+
+      ## Focus from the caller
+
+      $ARGUMENTS
+
+      ## The standards (name the one broken in every finding)
+
+      1. **Separation of concerns / boundaries.** Business rules (what the product *decides*) live
+         apart from I/O, frameworks, HTTP, persistence, rendering and third-party APIs. A rule you
+         cannot unit-test without a database, a server, a browser or a network call is in the wrong
+         place. Name the domain concept that is tangled and where it should live.
+      2. **Single responsibility.** A module, class or function has one reason to change.
+      3. **Small functions that do one thing**, at one level of abstraction (the stepdown rule).
+      4. **Meaningful names** that reveal intent; no misleading or noise names.
+      5. **Few arguments; no flag arguments; no hidden side effects; command–query separation.**
+      6. **DRY.** One authoritative place for each piece of knowledge (Rule of Three before extracting).
+      7. **Error handling** that does not obscure the logic; no swallowed errors, no null as a signal
+         where a type would do.
+      8. **Comments** that explain why, not what; no commented-out code, no lying comments.
+      9. **Tests that are F.I.R.S.T.** (fast, independent, repeatable, self-validating, timely) and
+         that test behaviour through the boundaries above, not implementation details.
+
+      ## How to work
+
+      1. Read CLAUDE.md / AGENTS.md / ARCHITECTURE docs first if they exist: the project's own rules
+         win over generic advice, and a finding must not contradict them.
+      2. Read the largest files and longest functions from the metrics, then follow the core
+         business logic (the part that would hurt most if it rotted: rules, state transitions,
+         pricing, scoring, conversation/dialogue logic, sync logic) wherever it lives.
+      3. Prefer findings that will matter as the codebase grows over cosmetic ones. Skip anything
+         already filed above. If the code is genuinely clean, return zero findings — that is a
+         valid, good outcome; do not invent work.
+      4. Group smells into refactors: one finding = one PR-sized change (roughly ≤10 files),
+         behaviour-preserving, independently mergeable.
+
+      ## Output
+
+      Use the Write tool to write exactly one file, `$ARTIFACTS_DIR/findings.json`, and nothing else:
+
+      ```json
+      {"summary": "<3-5 sentences on the codebase's overall clean-code health>",
+       "findings": [
+         {"title": "<imperative, under 80 chars, e.g. 'Separate the dialogue rules from the HTTP route'>",
+          "standard": "<one of the nine standards above, by name>",
+          "where": ["path/to/file.py:120-210", "..."],
+          "problem": "<what is wrong, concretely, citing functions and lines>",
+          "why_it_matters": "<what gets harder as the code grows>",
+          "refactor": "<the target shape: which modules/functions, what moves where>",
+          "acceptance": ["<checkable criterion>", "behaviour unchanged: existing tests pass", "..."]}
+       ]}
+      ```
+
+      Then reply with the summary and the finding titles.
+    depends_on: [scan, open-issues]
+    context: fresh
+    model: claude-fable-5-1
+    allowed_tools: [Read, Glob, Grep, Write]
+    hooks:
+      PreToolUse:
+        - matcher: "Write"
+          response:
+            hookSpecificOutput:
+              hookEventName: PreToolUse
+              additionalContext: >
+                The only file you may write is $ARTIFACTS_DIR/findings.json. Never write into the
+                repository.
+      PostToolUse:
+        - matcher: "Read"
+          response:
+            hookSpecificOutput:
+              hookEventName: PostToolUse
+              additionalContext: >
+                For the file you just read: where are its business rules, and could they be
+                unit-tested without I/O? Does each function do one thing at one level of
+                abstraction? Note concrete line ranges for any finding.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: FILE — one issue per finding, labelled clean-code
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: file-issues
+    bash: |
+      set -uo pipefail
+      F="$ARTIFACTS_DIR/findings.json"
+      if ! jq -e '.findings | type == "array"' "$F" >/dev/null 2>&1; then
+        echo "review wrote no readable $F" >&2
+        exit 1
+      fi
+      ORIGIN_REPO=$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')
+      gh label create clean-code --repo "$ORIGIN_REPO" --color 0E8A16 \
+        --description "Refactor found by the clean-code audit" >/dev/null 2>&1 || true
+      open_titles=$(gh issue list --repo "$ORIGIN_REPO" --label clean-code --state open --limit 100 --json title --jq '.[].title' 2>/dev/null || true)
+      n=$(jq '.findings | length' "$F")
+      echo "summary: $(jq -r .summary "$F")"
+      echo "findings: $n"
+      filed=0
+      for i in $(seq 0 $(( n < 5 ? n - 1 : 4 ))); do
+        [ "$n" -gt 0 ] || break
+        title=$(jq -r ".findings[$i].title" "$F")
+        if grep -Fxq "$title" <<<"$open_titles"; then
+          echo "skip (already open): $title"; continue
+        fi
+        body=$(jq -r --argjson i "$i" '.findings[$i] as $f | [
+          "Found by the nightly **clean-code audit** (Robert C. Martin standards).",
+          "",
+          "**Standard:** \($f.standard)",
+          "",
+          "**Where:**", ($f.where | map("- `\(.)`") | join("\n")),
+          "",
+          "## Problem", $f.problem,
+          "",
+          "## Why it matters", $f.why_it_matters,
+          "",
+          "## Refactor", $f.refactor,
+          "",
+          "This is a refactor: behaviour must not change. Follow the project'"'"'s CLAUDE.md and architecture docs; where they disagree with this issue, they win — say so in the PR.",
+          "",
+          "## Acceptance criteria",
+          ($f.acceptance | map("- [ ] \(.)") | join("\n"))
+        ] | join("\n")' "$F")
+        if url=$(gh issue create --repo "$ORIGIN_REPO" --title "$title" --label clean-code --body "$body"); then
+          echo "filed: $url"; filed=$((filed + 1))
+        else
+          echo "could not file: $title" >&2
+        fi
+      done
+      echo "CLEAN_CODE_FILED: $filed"
+    depends_on: [review]
+    timeout: 120000
