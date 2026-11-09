@@ -34,7 +34,7 @@ nodes:
     when: "$import.output == 'CHANGED'"
     depends_on: [import]
     context: fresh
-    model: claude-fable-5-1
+    model: claude-opus-5-5
     allowed_tools: [Read, Write, Edit, Glob, Grep]
     prompt: |
       You keep this game's **canon**: the story the game implements. The author writes and

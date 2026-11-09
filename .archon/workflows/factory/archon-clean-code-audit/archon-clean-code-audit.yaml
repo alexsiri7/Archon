@@ -128,7 +128,7 @@ nodes:
       Then reply with the summary and the finding titles.
     depends_on: [scan, open-issues]
     context: fresh
-    model: claude-fable-5-1
+    model: claude-opus-5-5
     allowed_tools: [Read, Glob, Grep, Write]
     hooks:
       PreToolUse:
