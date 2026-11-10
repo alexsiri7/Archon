@@ -68,6 +68,20 @@ nodes:
       Work sentence by sentence. A settled object can hold tentative sentences: take only the
       settled ones.
 
+      ## Outline scenes in the story format
+
+      `story/annie/outline/` holds the manuscript outline: per act, a PART with four chapters
+      (Puzzle chart, Rooms, Cutscenes, Conversations), one scene each, written one line per
+      beat in a fixed format (`GOAL:`/step lines, `ROOM:`/`*`/`-` lines, `CUTSCENE:` with
+      `NAME:`, `>`, `CAMERA:`, `MUSIC:`, `[effect]` lines, `CHARACTER:`/`KNOWS:`/`MUST SAY:` lines).
+      For these scenes the **status** decides, not the wording:
+      - `final`: settled. Copy the scene's lines into `story/CANON.md` under the act, verbatim
+        and in the same format (do not summarise them into prose), except `OPEN:` lines, which
+        go to PENDING. These scenes are the most exact spec the game has: in `what_changes`
+        and `acceptance`, name each final scene that differs from the game's content today.
+      - `outline`, `draft`, `revised`: not settled. List each in PENDING by act and title, one
+        line, without copying its contents, and never file implementation work for it.
+
       When settled Annie material contradicts the canon or the game, **Annie wins**: the author
       changed their mind. Record the contradiction, so the implementation issue can deal with it.
       When the game has decided something Annie leaves open (a name, for instance), keep the
