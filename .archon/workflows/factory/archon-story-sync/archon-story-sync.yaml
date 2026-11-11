@@ -21,7 +21,13 @@ nodes:
       rm -rf story/annie
       cp -r "$SRC" story/annie
       git add -A story/annie
-      if git diff --cached --quiet -- story/annie; then
+      # `--recurate` after the dir re-runs the curation over the whole bible even when the
+      # mirror is unchanged: for when these rules changed rather than the story.
+      if printf '%s' "$ARGUMENTS" | grep -qw -- '--recurate' && git diff --cached --quiet -- story/annie; then
+        echo "Re-curation requested: the mirror is unchanged, but the rules changed. Re-read all of story/annie/ and re-apply them." > "$ARTIFACTS_DIR/annie.diff"
+        : > "$ARTIFACTS_DIR/annie.stat"
+        echo "CHANGED"
+      elif git diff --cached --quiet -- story/annie; then
         echo "NO_CHANGES"
       else
         git diff --cached -- story/annie > "$ARTIFACTS_DIR/annie.diff"
