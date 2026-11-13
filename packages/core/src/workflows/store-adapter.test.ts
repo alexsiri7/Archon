@@ -30,6 +30,8 @@ const mockPauseWorkflowRunForWait = mock(() => Promise.resolve());
 const mockClearWorkflowWaitContext = mock(() => Promise.resolve({ cleared: true }));
 
 mock.module('../db/workflows', () => ({
+  getRunIdsByIsolationEnvId: mock(async (): Promise<string[]> => []),
+  getWorkflowRunsByIds: mock(async () => []),
   insertWorkflowRun: async (): Promise<never> => {
     throw new Error('Unexpected admission run insert');
   },
@@ -45,6 +47,7 @@ mock.module('../db/workflows', () => ({
   ),
   createWorkflowRun: mockCreateWorkflowRun,
   getWorkflowRun: mockGetWorkflowRun,
+  getWorkflowRunForAttention: mockGetWorkflowRun,
   findChildRuns: mockFindChildRuns,
   getRunAncestry: mockGetRunAncestry,
   getActiveWorkflowRunByPath: mockGetActiveWorkflowRunByPath,
@@ -52,6 +55,7 @@ mock.module('../db/workflows', () => ({
   resumeWorkflowRun: mockResumeWorkflowRun,
   recoverCancelledFanOutRun: mockRecoverCancelledFanOutRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
+  updateWorkflowRunMetadataIfRunning: mock(async () => true),
   updateWorkflowActivity: mockUpdateWorkflowActivity,
   getWorkflowRunStatus: mockGetWorkflowRunStatus,
   completeWorkflowRun: mockCompleteWorkflowRun,
@@ -73,6 +77,7 @@ const mockGetDagResumeSnapshot = mock<(_id: string) => Promise<DagResumeSnapshot
   Promise.resolve({
     completedNodeOutputs: new Map(),
     fanOutSnapshots: new Map(),
+    failedNodes: new Map(),
     unresolvedNodeStarts: new Set(),
     budget: { workUnits: 0, spendUsd: 0 },
     tokens: { input: 0, output: 0 },
@@ -275,6 +280,7 @@ describe('createWorkflowStore', () => {
       'resumeWorkflowRun',
       'recoverCancelledFanOutRun',
       'updateWorkflowRun',
+      'updateWorkflowRunMetadataIfRunning',
       'updateWorkflowActivity',
       'getWorkflowRunStatus',
       'completeWorkflowRun',
@@ -335,6 +341,7 @@ describe('createWorkflowStore', () => {
     const expected: DagResumeSnapshot = {
       completedNodeOutputs: new Map([['step1', { output: 'output text' }]]),
       fanOutSnapshots: new Map(),
+      failedNodes: new Map(),
       unresolvedNodeStarts: new Set(),
       budget: { workUnits: 0, spendUsd: 0 },
       tokens: { input: 40, output: 4 },
@@ -419,6 +426,12 @@ describe('createWorkflowDeps', () => {
       email: '42+connected@users.noreply.github.com',
     });
     expect(mockGetUserGithubAuthor).toHaveBeenCalledWith('user-1');
+  });
+  test('SQL and file dependency composition both supply external resource cleanup', () => {
+    expect(createWorkflowDeps().releaseRunResources).toEqual(expect.any(Function));
+    expect(createWorkflowDeps(createWorkflowStore(), 'files').releaseRunResources).toEqual(
+      expect.any(Function)
+    );
   });
   test('only the SQL host gets the SQL completed-run worktree release', () => {
     expect(createWorkflowDeps().completedRunWorktree).toEqual({

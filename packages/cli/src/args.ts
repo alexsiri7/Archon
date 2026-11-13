@@ -1,10 +1,12 @@
 import type { ParseArgsConfig } from 'util';
+import { CHAT_PROJECT_ID_ARG } from '@archon/paths/workflow-scope';
 
 type CliArgOptions = NonNullable<ParseArgsConfig['options']>;
 
 // The single options map for the top-level CLI parse. Kept in its own module
 // so tests can import it without executing cli.ts (whose import runs main).
 export const cliArgOptions: CliArgOptions = {
+  [CHAT_PROJECT_ID_ARG]: { type: 'string' },
   cwd: { type: 'string', default: process.cwd() },
   help: { type: 'boolean', short: 'h' },
   branch: { type: 'string', short: 'b' },
@@ -66,9 +68,17 @@ export const cliArgOptions: CliArgOptions = {
   'if-revision': { type: 'string' },
   prefix: { type: 'string' },
   project: { type: 'string' },
+  // `archon metrics` window, subject filter, cohort cut and model split.
+  since: { type: 'string' },
+  until: { type: 'string' },
+  subject: { type: 'string' },
+  compare: { type: 'string' },
+  'by-model': { type: 'string' },
   install: { type: 'boolean' },
   raw: { type: 'boolean' },
   values: { type: 'boolean' },
+  lease: { type: 'boolean' },
+  'release-lease': { type: 'boolean' },
   timeout: { type: 'string' },
   follow: { type: 'boolean' },
   format: { type: 'string' },
@@ -85,6 +95,7 @@ export const cliArgOptions: CliArgOptions = {
   // Repeatable sparse tier/@alias rebinding for one workflow invocation (#2481).
   model: { type: 'string', multiple: true },
   config: { type: 'string' },
+  'config-from-run': { type: 'string' },
   host: { type: 'string' },
   'delivery-id': { type: 'string' },
   inputs: { type: 'string' },

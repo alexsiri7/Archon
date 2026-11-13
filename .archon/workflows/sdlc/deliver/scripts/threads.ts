@@ -3,10 +3,9 @@
  * which threads are still unresolved, so the round never ends ready over an open one.
  *
  * Any unresolved review thread counts, whoever opened it. Threads are read and written
- * through gh alone: the forge contract has no review-thread operations, so the YAML
- * runs this node only on the gh source and the report records the threads as not
- * checked on the forge source. An unreadable thread state, a reply that fails, or a
- * resolution that does not read back fails the node rather than reading as clear.
+ * through the forge operations `pr.threads`, `pr.thread.reply` and `pr.thread.resolve`.
+ * An unreadable thread state, a reply that fails, or a resolution that does not read
+ * back fails the node rather than reading as clear.
  *
  * The unresolved threads go to `$ARTIFACTS_DIR/threads.md`, quoted as untrusted review
  * data, for the next round's implementer to judge. A pull request with an open thread
@@ -21,9 +20,15 @@
 
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { parsePrRecord, record, type PrRecord, type QualifiedPr } from '../../.shared/forge.ts';
+import {
+  invokeForge,
+  parsePrRecord,
+  record,
+  type PrRecord,
+  type QualifiedPr,
+} from '../../.shared/forge.ts';
 import { artifactsDir, emit, nullableJson, refuse, text } from '../../.shared/io.ts';
-import { ghGraphql, setPrDraft } from '../../.shared/pr.ts';
+import { setPrDraft, viewPr } from '../../.shared/pr.ts';
 
 interface ThreadComment {
   readonly author: string | null;
@@ -51,51 +56,25 @@ interface PrThreads {
   readonly threads: readonly Thread[];
 }
 
-const THREADS_QUERY = `query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) {
-  pullRequest(number: $number) {
-    state isDraft
-    reviewThreads(first: 100) { totalCount nodes {
-      id isResolved isOutdated path line
-      comments(first: 100) { totalCount nodes { author { login } body url } }
-    } }
-  }
-} }`;
-
-const REPLY = `mutation($thread: ID!, $body: String!) {
-  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $thread, body: $body }) { comment { url } }
-}`;
-
-const RESOLVE = `mutation($thread: ID!) { resolveReviewThread(input: { threadId: $thread }) { thread { isResolved } } }`;
-
-function nodesOf(connection: unknown, what: string): Record<string, unknown>[] {
-  const value = record(connection);
-  const nodes = Array.isArray(value?.nodes) ? value.nodes.map(node => record(node) ?? {}) : [];
-  if (typeof value?.totalCount !== 'number') throw new Error(`gh api graphql returned no ${what} count`);
-  // A partial read could hide an open thread, so more than one page is refused.
-  if (value.totalCount > nodes.length) {
-    throw new Error(`there are ${String(value.totalCount)} ${what}; delivery reads at most ${String(nodes.length)}`);
-  }
-  return nodes;
-}
-
+/** The threads through `pr.threads`, which reads every page itself. */
 function readThreads(pr: QualifiedPr): PrThreads {
-  const [owner, name] = pr.repo.path.split('/');
-  const row = record(
-    record(ghGraphql(pr.repo.host, THREADS_QUERY, { owner: owner ?? '', name: name ?? '', number: pr.number }).repository)
-      ?.pullRequest
-  );
-  if (row === undefined) throw new Error(`${pr.repo.path} has no pull request ${String(pr.number)}`);
-  const threads = nodesOf(row.reviewThreads, 'review threads').map((node): Thread => {
-    if (typeof node.id !== 'string' || typeof node.isResolved !== 'boolean') {
-      throw new Error('gh api graphql returned a review thread without its id and resolution');
+  const ref = { repo: pr.repo, number: pr.number };
+  const view = viewPr(pr);
+  const value = invokeForge('pr.threads', { ref });
+  if (!Array.isArray(value?.threads)) throw new Error('forge pr.threads returned no thread list');
+  const threads = value.threads.map((raw): Thread => {
+    const node = record(raw);
+    if (typeof node?.id !== 'string' || typeof node.resolved !== 'boolean') {
+      throw new Error('forge pr.threads returned a thread without its id and resolution');
     }
+    const comments = Array.isArray(node.comments) ? node.comments.map(item => record(item) ?? {}) : [];
     return {
       id: node.id,
-      resolved: node.isResolved,
-      outdated: node.isOutdated === true,
+      resolved: node.resolved,
+      outdated: node.outdated === true,
       path: typeof node.path === 'string' ? node.path : '',
       line: typeof node.line === 'number' ? node.line : null,
-      comments: nodesOf(node.comments, `comments on thread ${node.id}`).map(comment => {
+      comments: comments.map(comment => {
         const login = record(comment.author)?.login;
         return {
           author: typeof login === 'string' && login !== '' ? login : null,
@@ -105,7 +84,7 @@ function readThreads(pr: QualifiedPr): PrThreads {
       }),
     };
   });
-  return { open: row.state === 'OPEN', draft: row.isDraft === true, threads };
+  return { open: view.pr.state === 'open', draft: view.pr.is_draft, threads };
 }
 
 function parseAnswers(value: unknown): Answer[] {
@@ -121,17 +100,22 @@ function parseAnswers(value: unknown): Answer[] {
 }
 
 /** Reply on each answered thread, then resolve it. A thread someone already resolved needs neither. */
-function postAnswers(pr: QualifiedPr, threads: readonly Thread[], answers: readonly Answer[]): void {
+function postAnswers(
+  pr: QualifiedPr,
+  threads: readonly Thread[],
+  answers: readonly Answer[]
+): void {
   const byId = new Map(threads.map(thread => [thread.id, thread]));
   const unknown = answers.filter(answer => !byId.has(answer.thread));
   if (unknown.length > 0) {
     throw new Error(`answers name threads ${pr.repo.path}#${String(pr.number)} does not have: ${unknown.map(a => a.thread).join(', ')}`);
   }
+  const ref = { repo: pr.repo, number: pr.number };
   for (const answer of answers) {
     if (byId.get(answer.thread)?.resolved) continue;
-    const reply = record(record(ghGraphql(pr.repo.host, REPLY, { thread: answer.thread, body: answer.reply }).addPullRequestReviewThreadReply)?.comment);
-    if (typeof reply?.url !== 'string') throw new Error(`the reply on thread ${answer.thread} did not read back`);
-    ghGraphql(pr.repo.host, RESOLVE, { thread: answer.thread });
+    // Each write reads itself back; a failure throws with its outcome evidence.
+    invokeForge('pr.thread.reply', { ref, thread: answer.thread, body: answer.reply });
+    invokeForge('pr.thread.resolve', { ref, thread: answer.thread });
   }
 }
 
@@ -169,7 +153,7 @@ function threadsReport(url: string, threads: readonly Thread[]): string {
 /** Puts the pull request back to draft after a failure, naming why when that fails too. */
 function draftAfterFailure(pr: QualifiedPr): string {
   try {
-    setPrDraft(pr, true, 'gh');
+    setPrDraft(pr, true);
     return '';
   } catch (error) {
     return `; it may still be ready: ${error instanceof Error ? error.message : String(error)}`;
@@ -191,7 +175,7 @@ try {
   }
   const open = read.threads.filter(thread => !thread.resolved);
   writeFileSync(join(artifactsDir(), 'threads.md'), threadsReport(pr.url, open));
-  if (open.length > 0 && read.open && !read.draft) setPrDraft(pr, true, 'gh');
+  if (open.length > 0 && read.open && !read.draft) setPrDraft(pr, true);
   emit({
     open: open.length,
     summary:

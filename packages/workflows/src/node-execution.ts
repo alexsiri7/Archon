@@ -69,6 +69,18 @@ function measurement<T>(
   };
 }
 
+function defaultNodeAccounting(node: NodeDescriptor): NodeExecutionRecord['accounting'] {
+  switch (node.kind) {
+    case 'compose_fan_out_instance':
+      return 'instance';
+    case 'loop_group':
+    case 'compose_fan_out':
+      return 'aggregate';
+    default:
+      return 'node';
+  }
+}
+
 export function startNodeExecution(input: {
   runId: string;
   path: string;
@@ -128,13 +140,7 @@ export function startNodeExecution(input: {
       stopReason: measurement<string>(undefined, caps?.stopReasonReporting, hasProvider),
       numTurns: measurement<number>(undefined, caps?.turnCountReporting, hasProvider),
     },
-    accounting:
-      input.accounting ??
-      (node.kind === 'compose_fan_out_instance'
-        ? 'instance'
-        : node.kind === 'loop_group' || node.kind === 'compose_fan_out'
-          ? 'aggregate'
-          : 'node'),
+    accounting: input.accounting ?? defaultNodeAccounting(node),
     lifecycle: { status: 'started' },
   };
 }
@@ -164,16 +170,6 @@ export function finishNodeExecution(
     providerNotCalled?: boolean;
   } = {}
 ): NodeExecutionRecord {
-  const observed = <T>(
-    value: T | undefined,
-    previous: Measurement<T>,
-    valid: (candidate: T) => boolean = () => true
-  ): Measurement<T> =>
-    value === undefined
-      ? previous
-      : valid(value)
-        ? { source: 'provider' as const, value }
-        : { source: 'unavailable' as const, reason: 'invalid' as const };
   const binding: ExecutionBinding = {
     ...start.binding,
     ...(start.binding.model
@@ -199,32 +195,50 @@ export function finishNodeExecution(
       startedAt: start.timing.startedAt,
       durationMs: result.durationMs ?? Math.max(0, Date.now() - Date.parse(start.timing.startedAt)),
     },
-    spend: result.providerNotCalled
-      ? {
-          tokens: NOT_APPLICABLE,
-          costUsd: NOT_APPLICABLE,
-          stopReason: NOT_APPLICABLE,
-          numTurns: NOT_APPLICABLE,
-        }
-      : {
-          tokens: result.tokensUnknown
-            ? { source: 'unavailable', reason: 'incomplete' }
-            : observed(
-                result.tokens,
-                start.spend.tokens,
-                value => tokenUsageSchema.safeParse(value).success
-              ),
-          costUsd: withCostPartial(
-            observed(result.costUsd, start.spend.costUsd, Number.isFinite),
-            result.costPartial === true
-          ),
-          stopReason: observed(result.stopReason, start.spend.stopReason),
-          numTurns: observed(result.numTurns, start.spend.numTurns, Number.isFinite),
-        },
+    spend: observeExecutionSpend(start.spend, result),
     ...(result.output !== undefined ? { output: result.output } : {}),
     ...(result.diagnostics !== undefined ? { diagnostics: result.diagnostics } : {}),
     ...(result.sessionId ? { sessionId: result.sessionId } : {}),
   };
+}
+
+const observed = <T>(
+  value: T | undefined,
+  previous: Measurement<T>,
+  valid: (candidate: T) => boolean = () => true
+): Measurement<T> =>
+  value === undefined
+    ? previous
+    : valid(value)
+      ? { source: 'provider' as const, value }
+      : { source: 'unavailable' as const, reason: 'invalid' as const };
+
+export function observeExecutionSpend(
+  previous: NodeExecutionRecord['spend'],
+  result: ExecutionObservations & { providerNotCalled?: boolean }
+): NodeExecutionRecord['spend'] {
+  return result.providerNotCalled
+    ? {
+        tokens: NOT_APPLICABLE,
+        costUsd: NOT_APPLICABLE,
+        stopReason: NOT_APPLICABLE,
+        numTurns: NOT_APPLICABLE,
+      }
+    : {
+        tokens: result.tokensUnknown
+          ? { source: 'unavailable', reason: 'incomplete' }
+          : observed(
+              result.tokens,
+              previous.tokens,
+              value => tokenUsageSchema.safeParse(value).success
+            ),
+        costUsd: withCostPartial(
+          observed(result.costUsd, previous.costUsd, Number.isFinite),
+          result.costPartial === true
+        ),
+        stopReason: observed(result.stopReason, previous.stopReason),
+        numTurns: observed(result.numTurns, previous.numTurns, Number.isFinite),
+      };
 }
 
 const NOT_APPLICABLE = { source: 'unavailable', reason: 'not_applicable' } as const;
@@ -232,7 +246,9 @@ const NOT_APPLICABLE = { source: 'unavailable', reason: 'not_applicable' } as co
 type CostMeasurement = NodeExecutionRecord['spend']['costUsd'];
 
 function withCostPartial(cost: CostMeasurement, partial: boolean): CostMeasurement {
-  return partial && cost.source === 'provider' ? { ...cost, partial: true } : cost;
+  if (!partial) return cost;
+  if (cost.source === 'provider') return { ...cost, partial: true };
+  return cost.reason === 'not_applicable' ? { source: 'unavailable', reason: 'incomplete' } : cost;
 }
 
 /** Excludes output bodies and diagnostics from the shared public execution facts. */

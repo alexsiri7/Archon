@@ -1,13 +1,13 @@
 /**
  * Database operations for codebases
  */
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import {
   ActiveContainerEnvironmentsError,
   ActiveWorktreeEnvironmentsError,
 } from './codebase-delete-error';
 import { ACTIVE_CONTAINER_ENVIRONMENT_PREDICATE } from './isolation-environment-predicates';
-import { assertAbsoluteDefaultCwd } from './codebase-path';
+import { assertAbsoluteDefaultCwd, defaultCwdKey, isSameDefaultCwd } from './codebase-path';
 export { InvalidCodebaseDefaultCwdError } from './codebase-path';
 import { pool, getDatabase, getDatabaseType, getDialect } from './connection';
 import {
@@ -25,7 +25,7 @@ import {
 } from '@archon/paths';
 import {
   allocateProjectName,
-  isCheckoutRegistered,
+  removeCheckoutUnlessRegistered,
   resolveRegistrationUrl,
 } from '../services/project-registration-identity';
 import {
@@ -123,25 +123,23 @@ async function insertCodebase(data: CreateCodebaseInput, managed: boolean): Prom
 
 export async function removeUnregisteredCheckout(
   path: string,
-  remove: () => Promise<void>
+  remove: (detached: string) => Promise<void>
 ): Promise<void> {
-  // SQLite may retry a transaction after COMMIT; filesystem removal must run only once.
-  let removed = false;
-  await getDatabase().withTransaction(async query => {
-    if (getDatabaseType() === 'postgresql') {
-      await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
-        CODEBASE_IDENTITY_LOCK,
-      ]);
-    } else {
-      // BEGIN is deferred; reserve the SQLite writer before checking filesystem ownership.
-      await query('UPDATE remote_agent_codebases SET id = id WHERE 1 = 0');
-    }
-    const registered = await query<Codebase>('SELECT * FROM remote_agent_codebases');
-    if (!removed && !(await isCheckoutRegistered(path, registered.rows))) {
-      await remove();
-      removed = true;
-    }
-  });
+  await removeCheckoutUnlessRegistered(path, remove, detachIfUnregistered =>
+    getDatabase().withTransaction(async query => {
+      if (getDatabaseType() === 'postgresql') {
+        await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          CODEBASE_IDENTITY_LOCK,
+        ]);
+      } else {
+        // BEGIN is deferred; reserve the SQLite writer before checking filesystem ownership.
+        await query('UPDATE remote_agent_codebases SET id = id WHERE 1 = 0');
+      }
+      await detachIfUnregistered(
+        async () => (await query<Codebase>('SELECT * FROM remote_agent_codebases')).rows
+      );
+    })
+  );
 }
 
 export async function getCodebase(id: string): Promise<Codebase | null> {
@@ -201,11 +199,11 @@ export async function findCodebaseByRepoUrl(repoUrl: string): Promise<Codebase |
 }
 
 export async function findCodebaseByDefaultCwd(defaultCwd: string): Promise<Codebase | null> {
+  // Matched in application code: Windows spells one directory several ways (see defaultCwdKey).
   const result = await pool.query<Codebase>(
-    'SELECT * FROM remote_agent_codebases WHERE default_cwd = $1 ORDER BY created_at DESC LIMIT 1',
-    [defaultCwd]
+    'SELECT * FROM remote_agent_codebases ORDER BY created_at DESC'
   );
-  const row = result.rows[0];
+  const row = result.rows.find(row => isSameDefaultCwd(row.default_cwd, defaultCwd));
   return row ? validateCodebase(row) : null;
 }
 
@@ -219,13 +217,16 @@ export async function findCodebaseByDefaultCwd(defaultCwd: string): Promise<Code
  * which was wrong on two counts: (1) `_`/`%` in a stored path are LIKE
  * wildcards, and (2) a bare `%` suffix has no separator boundary, so a sibling
  * directory sharing a name prefix (`/x/platform` vs `/x/platform-staging`)
- * would match. Returns the most specific (longest `default_cwd`) match.
+ * would match. Both paths are compared by their `defaultCwdKey`. Returns the
+ * most specific (longest `default_cwd`) match.
  */
 export async function findCodebaseByPathPrefix(cwdPath: string): Promise<Codebase | null> {
   const result = await pool.query<Codebase>('SELECT * FROM remote_agent_codebases');
   let best: { row: Codebase; rootLength: number } | null = null;
-  for (const row of result.rows.map(validateCodebase)) {
-    if (!isPathInside(row.default_cwd, cwdPath, { includeRoot: true, lexical: true })) continue;
+  for (const row of result.rows) {
+    if (!isAbsolute(row.default_cwd)) continue;
+    const root = defaultCwdKey(row.default_cwd);
+    if (!isPathInside(root, defaultCwdKey(cwdPath), { includeRoot: true, lexical: true })) continue;
     // Rank on the normalized root: isPathInside matched it, and a stored spelling
     // with trailing separators would otherwise outrank a nested codebase.
     const rootLength = resolve(row.default_cwd).length;
@@ -345,12 +346,12 @@ const CODEBASE_IDENTITY_LOCK = JSON.stringify(['codebase-rename']);
  * and future runs across different roots.
  *
  * Names are not UNIQUE in the schema, but `findCodebaseByName` resolves them
- * for `--project` and `/update-project`, so a duplicate is refused too. The
- * duplicate check lives in the UPDATE itself. On PostgreSQL that is not enough:
- * under READ COMMITTED two concurrent UPDATEs of different rows each evaluate
- * NOT EXISTS without seeing the other, so renames also take an advisory lock.
- * The waiting rename's UPDATE then reads a fresh snapshot that includes the
- * winner. SQLite serializes writers already.
+ * for `--project` and `/update-project`, so a name another project already uses
+ * is refused, compared by `toLowerCase()` as registration does. A project may
+ * still change the case of its own name. The check reads every name inside the
+ * transaction, after the PostgreSQL identity lock that registrations share, so
+ * a concurrent rename or registration cannot claim the name between the check
+ * and the UPDATE. SQLite retries a transaction whose read snapshot went stale.
  */
 export async function renameCodebase(id: string, name: string): Promise<Codebase> {
   const current = await getCodebase(id);
@@ -369,21 +370,27 @@ export async function renameCodebase(id: string, name: string): Promise<Codebase
     );
   }
 
-  const result = await getDatabase().withTransaction(async query => {
+  await getDatabase().withTransaction(async query => {
     if (getDatabaseType() === 'postgresql') {
       await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
         CODEBASE_IDENTITY_LOCK,
       ]);
     }
-    return query(
-      `UPDATE remote_agent_codebases SET name = $1, updated_at = ${getDialect().now()} WHERE id = $2 ` +
-        'AND NOT EXISTS (SELECT 1 FROM remote_agent_codebases WHERE name = $1 AND id <> $2)',
+    const others = await query<Pick<Codebase, 'name'>>(
+      'SELECT name FROM remote_agent_codebases WHERE id <> $1',
+      [id]
+    );
+    const requested = name.toLowerCase();
+    if (others.rows.some(other => other.name.toLowerCase() === requested)) {
+      throw new CodebaseNameTakenError(name);
+    }
+    await query(
+      `UPDATE remote_agent_codebases SET name = $1, updated_at = ${getDialect().now()} WHERE id = $2`,
       [name, id]
     );
   });
   const renamed = await getCodebase(id);
   if (!renamed) throw new CodebaseNotFoundError(id);
-  if ((result.rowCount ?? 0) === 0) throw new CodebaseNameTakenError(name);
   getLog().info({ codebaseId: id, from: current.name, to: name }, 'db.codebase_renamed');
   return renamed;
 }

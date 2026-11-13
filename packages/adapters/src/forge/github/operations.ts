@@ -1,34 +1,27 @@
-import { z } from 'zod';
-import { checkPhase, checkResult } from './normalize-event';
 import {
-  type CheckObservation,
+  PR_VIEW_ANY_STATE,
   type ForgeError,
+  type ForgeMutationRequest,
   type ForgeRequest,
   type ForgeResponse,
   type PluginMetadata,
-  concludedCheckStates,
   isMutationRequest,
   mutationTarget,
   mutationAttempt,
-  summarizeChecks,
 } from '@archon/forge/operations';
+import { githubErrorDetail, parseRemote, TransientGitHubError, type Fetch } from './api';
+import { handleGithubChecksCommit, handleGithubChecksState } from './commit-checks';
+import { handleGithubWorkItemComments } from './comments';
+import { handleGithubPrFiles, handleGithubRepoFile } from './files';
+import { handleGithubPrMergeState } from './merge-state';
+import { handleGithubMutation } from './lifecycle';
+import { handleGithubPrReviews, handleGithubPrView } from './pull-requests';
 import {
-  githubErrorDetail,
-  githubPages,
-  githubRequest,
-  location,
-  parseRemote,
-  type Fetch,
-} from './api';
-import { readWorkflowRuns } from './workflow-runs';
-import {
-  handleGithubPrReviews,
-  handleGithubMutation,
-  handleGithubPrView,
-  handleGithubWorkItemView,
-  handleGithubWorkItemList,
   handleGithubRepoLabelsList,
-} from './lifecycle';
+  handleGithubWorkItemList,
+  handleGithubWorkItemView,
+} from './workitems';
+import { handleGithubPrThreads } from './review-threads';
 
 export const githubPluginMetadata = {
   protocol: 1,
@@ -39,17 +32,21 @@ export const githubPluginMetadata = {
   capabilities: [
     'resolve',
     'checks.state',
+    'checks.commit',
     'workitem.view',
+    'workitem.comments',
     'workitem.create',
     'workitem.labels.set',
     'workitem.label.add',
     'workitem.label.remove',
     'workitem.comment.upsert',
     'workitem.close',
+    'workitem.edit-body',
     'workitem.list',
     'repo.labels.list',
     'repo.label.ensure',
     'pr.view',
+    PR_VIEW_ANY_STATE,
     'pr.create',
     'pr.edit-body',
     'pr.ready',
@@ -58,6 +55,12 @@ export const githubPluginMetadata = {
     'pr.merge',
     'checks.rerun',
     'pr.reviews',
+    'pr.threads',
+    'pr.merge-state',
+    'pr.files',
+    'repo.file',
+    'pr.thread.reply',
+    'pr.thread.resolve',
   ],
   mutationConditions: { 'pr.merge': ['head'] },
   token_env: ['GH_TOKEN', 'GITHUB_TOKEN'],
@@ -66,78 +69,58 @@ export const githubPluginMetadata = {
 export interface GitHubOperationOptions {
   readonly token: string | undefined;
   readonly fetch?: Fetch;
+  readonly sleep?: (ms: number) => Promise<unknown>;
 }
 
-const pullRequestSchema = z.object({ head: z.object({ sha: z.string().min(1) }) });
-const checkRunSchema = z.object({
-  id: z.union([z.string().min(1), z.number().int()]),
-  name: z.string().min(1),
-  status: z.string().min(1),
-  conclusion: z.string().nullable().optional(),
-  head_sha: z.string().optional(),
-  check_suite: z.object({ id: z.number().int() }).nullable().optional(),
-  app: z.object({ slug: z.string().nullable().optional() }).nullable().optional(),
-});
-const checkRunsPageSchema = z.object({ check_runs: z.array(checkRunSchema) });
-const statusSchema = z.object({
-  id: z.union([z.string().min(1), z.number().int()]),
-  context: z.string().min(1),
-  state: z.string().min(1),
-});
-const statusesPageSchema = z.array(statusSchema);
+/** The waits before each repeat of a read; their count is the number of repeats. */
+const READ_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+
+/**
+ * Run a read, repeating it from its start while it fails with a
+ * {@link TransientGitHubError}. A read changes nothing, so a repeat is always
+ * safe; a mutation never comes through here, because a 5xx can arrive after
+ * GitHub applied it. Every other failure, and the last transient one, is thrown.
+ */
+async function readWithRetry(
+  read: () => Promise<ForgeResponse>,
+  sleep: (ms: number) => Promise<unknown>
+): Promise<ForgeResponse> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await read();
+    } catch (cause) {
+      const delay = READ_RETRY_DELAYS_MS[attempt];
+      if (!(cause instanceof TransientGitHubError) || delay === undefined) throw cause;
+      await sleep(delay);
+    }
+  }
+}
 
 function failure(operationId: string, error: ForgeError): ForgeResponse {
   return { operationId, ok: false, error };
 }
 
-function checkRunObservation(run: z.infer<typeof checkRunSchema>): CheckObservation {
-  const nativeResult = run.conclusion ?? null;
-  const normalizedResult = checkResult(nativeResult);
-  if (['queued', 'waiting', 'pending', 'in_progress'].includes(run.status)) {
-    return {
-      unit: { kind: 'check', id: String(run.id), name: run.name },
-      nativeState: run.status,
-      phase: checkPhase(run.status),
-      nativeResult,
-      result: normalizedResult,
-      state: 'pending',
-    };
-  }
-  const state =
-    run.status !== 'completed' || normalizedResult === null
-      ? 'unknown'
-      : concludedCheckStates[normalizedResult];
-  return {
-    unit: { kind: 'check', id: String(run.id), name: run.name },
-    nativeState: run.status,
-    phase: checkPhase(run.status),
-    nativeResult,
-    result: normalizedResult,
-    state,
-  };
-}
+type ReadOp = Exclude<ForgeRequest['op'], 'resolve' | ForgeMutationRequest['op']>;
+type ReadHandler<Op extends ReadOp> = (
+  request: Extract<ForgeRequest, { op: Op }>,
+  fetchImpl: Fetch,
+  token: string
+) => Promise<ForgeResponse>;
 
-function statusObservation(status: z.infer<typeof statusSchema>): CheckObservation {
-  const state =
-    status.state === 'pending'
-      ? 'pending'
-      : status.state === 'success'
-        ? 'green'
-        : status.state === 'failure' || status.state === 'error'
-          ? 'red'
-          : 'unknown';
-  return {
-    unit: { kind: 'commit_status', id: String(status.id), name: status.context },
-    nativeState: status.state,
-    phase: checkPhase(status.state),
-    nativeResult: status.state,
-    result:
-      status.state === 'pending'
-        ? null
-        : checkResult(status.state === 'error' ? 'failure' : status.state),
-    state,
-  };
-}
+const readHandlers: { [Op in ReadOp]: ReadHandler<Op> } = {
+  'workitem.view': handleGithubWorkItemView,
+  'workitem.list': handleGithubWorkItemList,
+  'workitem.comments': handleGithubWorkItemComments,
+  'repo.labels.list': handleGithubRepoLabelsList,
+  'pr.view': handleGithubPrView,
+  'pr.reviews': handleGithubPrReviews,
+  'pr.threads': handleGithubPrThreads,
+  'pr.merge-state': handleGithubPrMergeState,
+  'pr.files': handleGithubPrFiles,
+  'repo.file': handleGithubRepoFile,
+  'checks.state': handleGithubChecksState,
+  'checks.commit': handleGithubChecksCommit,
+};
 
 export async function handleGithubOperation(
   request: ForgeRequest,
@@ -181,83 +164,10 @@ export async function handleGithubOperation(
     const fetchImpl = options.fetch ?? globalThis.fetch;
     const token = options.token;
     if (isMutationRequest(request)) return await handleGithubMutation(request, fetchImpl, token);
-    if (request.op === 'workitem.view')
-      return await handleGithubWorkItemView(request, fetchImpl, token);
-    if (request.op === 'workitem.list')
-      return await handleGithubWorkItemList(request, fetchImpl, token);
-    if (request.op === 'repo.labels.list')
-      return await handleGithubRepoLabelsList(request, fetchImpl, token);
-    if (request.op === 'pr.reviews') return await handleGithubPrReviews(request, fetchImpl, token);
-    if (request.op === 'pr.view') return await handleGithubPrView(request, fetchImpl, token);
-
-    const { root, path } = location(request.ref.repo);
-    const pull = pullRequestSchema.parse(
-      await githubRequest(
-        fetchImpl,
-        token,
-        `${root}/repos/${path}/pulls/${String(request.ref.number)}`
-      )
-    );
-    const revision = pull.head.sha;
-    const ref = encodeURIComponent(revision);
-    const [runs, allStatuses, workflows] = await Promise.all([
-      githubPages(
-        fetchImpl,
-        token,
-        `${root}/repos/${path}/commits/${ref}/check-runs?filter=latest`,
-        value => checkRunsPageSchema.parse(value).check_runs
-      ),
-      githubPages(fetchImpl, token, `${root}/repos/${path}/commits/${ref}/statuses`, value =>
-        statusesPageSchema.parse(value)
-      ),
-      readWorkflowRuns(fetchImpl, token, request.ref.repo, revision),
-    ]);
-    // GitHub returns statuses newest first. Context names are case-insensitive, so the
-    // first row for each folded context is the authoritative latest status unit.
-    const contexts = new Set<string>();
-    const statuses = allStatuses.filter(status => {
-      const context = status.context.toLowerCase();
-      if (contexts.has(context)) return false;
-      contexts.add(context);
-      return true;
-    });
-    const units = [
-      ...runs.map(run => {
-        const associated = workflows.filter(
-          workflow =>
-            workflow.head_sha === revision && workflow.check_suite_id === run.check_suite?.id
-        );
-        const workflow = associated.length === 1 ? associated[0] : undefined;
-        return {
-          ...checkRunObservation(run),
-          rerun:
-            run.app?.slug === 'github-actions' && run.head_sha === revision && workflow
-              ? { id: String(workflow.id), attempt: workflow.run_attempt }
-              : null,
-        };
-      }),
-      ...statuses.map(status => ({ ...statusObservation(status), rerun: null })),
-    ];
-    return {
-      operationId: request.operationId,
-      ok: true,
-      result: {
-        op: 'checks.state',
-        value: {
-          ref: request.ref,
-          revision,
-          approvalPending:
-            workflows.some(
-              run => run.head_sha === revision && run.conclusion === 'action_required'
-            ) || units.some(unit => unit.result === 'action_required'),
-          units,
-          summary: summarizeChecks(units),
-          // The check-runs and statuses APIs enumerate observations but do not say which
-          // checks branch protection requires. Returning null keeps that absence explicit.
-          required: null,
-        },
-      },
-    };
+    // Keyed by the request's own op, the handler takes that request; TypeScript cannot
+    // correlate the table's members with the request union on its own.
+    const read = readHandlers[request.op] as ReadHandler<ReadOp>;
+    return await readWithRetry(() => read(request, fetchImpl, token), options.sleep ?? Bun.sleep);
   } catch (cause) {
     return failure(request.operationId, githubErrorDetail(cause));
   }

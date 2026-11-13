@@ -1,8 +1,10 @@
 import { spyOn } from 'bun:test';
+import Ajv from 'ajv';
 import * as binaryResolver from './binary-resolver';
 import { overStreams } from '../test/plugin';
 import { createProvider, descriptor } from './index';
 import { describe, test, expect, mock, beforeEach, beforeAll, afterAll } from 'bun:test';
+import { existsSync } from 'fs';
 import { mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -46,6 +48,8 @@ import {
   type FakeTurnScript,
 } from '../test/codex-app-server-fake';
 import { CodexProvider } from './provider';
+import * as pluginProcess from '@archon/paths/plugin-process';
+import { TOOL_FREE_THREAD_CONFIG } from './turn-params';
 import type { CodexErrorInfo } from './protocol/v2/CodexErrorInfo';
 import type { ServerNotification } from './protocol/ServerNotification';
 
@@ -159,11 +163,73 @@ afterAll(() => {
 });
 
 beforeEach(() => {
+  mockLogger.error.mockClear();
   mockLogger.warn.mockClear();
   mockLogger.info.mockClear();
 });
 
 describe('CodexProvider', () => {
+  test.each([false, true])(
+    'a post-result cleanup failure throws without settling (remote=%s)',
+    async remote => {
+      const originalPlatform = process.platform;
+      const stop = spyOn(pluginProcess, 'terminateTree').mockRejectedValue(
+        new Error('cleanup refused')
+      );
+      try {
+        const server = createFakeAppServer();
+        const provider = new CodexProvider((command, args, options) => {
+          Object.defineProperty(process, 'platform', { value: 'linux' });
+          const child = server(command, args, options);
+          Object.defineProperty(child, 'pid', { value: 2_147_483_647 });
+          return child;
+        });
+        const client = remote ? overStreams(() => provider, descriptor) : provider;
+        const chunks: MessageChunk[] = [];
+        const collect = async (): Promise<void> => {
+          for await (const chunk of client.sendQuery('test', '/workspace')) chunks.push(chunk);
+        };
+        await expect(collect()).rejects.toThrow('cleanup refused');
+        expect(chunks.map(chunk => chunk.type)).toEqual(['result']);
+        expect(mockLogger.error).toHaveBeenCalledWith(
+          expect.objectContaining({
+            err: expect.objectContaining({ message: expect.stringContaining('cleanup refused') }),
+          }),
+          'codex.app_server_abnormal_exit'
+        );
+      } finally {
+        Object.defineProperty(process, 'platform', { value: originalPlatform });
+        stop.mockRestore();
+      }
+    }
+  );
+
+  test('post-result diagnostics share a run ID and settle only after shutdown', async () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      mockLogger.debug.mockClear();
+      const { provider } = providerWith();
+      for await (const chunk of provider.sendQuery('private prompt', '/workspace')) {
+        const calls = mockLogger.debug.mock.calls.filter(([fields]) => 'runId' in fields);
+        if (chunk.type === 'result') expect(calls).toEqual([]);
+        if (chunk.type === 'settled') {
+          const runId: unknown = calls[0][0].runId;
+          expect(typeof runId).toBe('string');
+          expect(calls).toEqual([
+            [{ runId }, 'codex.host_tool_calls_finished'],
+            [{ runId }, 'codex.stdin_finished'],
+            [{ runId, code: 0, signal: null }, 'codex.child_exit'],
+            [{ runId }, 'codex.child_close'],
+            [{ runId }, 'codex.settle'],
+          ]);
+          ids.push(String(runId));
+        }
+      }
+    }
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+  });
+
   test('getType returns codex', () => {
     expect(new CodexProvider().getType()).toBe('codex');
   });
@@ -709,6 +775,15 @@ describe('CodexProvider', () => {
       expect(server.processes[0].stdinEnded).toBe(true);
     });
 
+    test('a Codex slow to exit after its turn is awaited without SIGTERM and settles', async () => {
+      // Codex shutting down on a loaded machine outlasts the cancel grace. A SIGTERM in
+      // that window would make it exit 1 and lose the settle.
+      const server = createFakeAppServer(() => ({ exitsAfterStdinCloseMs: 100 }));
+      const chunks = await run(new CodexProvider(server, 20));
+      expect(server.processes[0].signals).toEqual([]);
+      expect(chunks.map(c => c.type)).toEqual(['result', 'settled']);
+    });
+
     test('an abnormal process exit after the final notification is not a settle', async () => {
       const { provider, server } = providerWith({
         notifications: [turnCompleted('completed')],
@@ -717,6 +792,18 @@ describe('CodexProvider', () => {
       const chunks = await run(provider);
       expect(chunks.map(c => c.type)).toEqual(['result']);
       expect(server.processes[0].signals).toEqual([]);
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ lifecycle: 'process_abnormal_exit' }),
+        'codex.app_server_abnormal_exit'
+      );
+    });
+
+    test('a spawn failure is logged without the abnormal-exit lifecycle tag', async () => {
+      await run(providerWith({ spawnError: 'ENOENT' }).provider);
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.not.objectContaining({ lifecycle: expect.anything() }),
+        'codex.app_server_abnormal_exit'
+      );
     });
 
     test('lost observation after the result never invents an end or settles', async () => {
@@ -898,7 +985,10 @@ describe('CodexProvider', () => {
         assistantConfig: { webSearchMode: 'live', additionalDirectories: ['/extra'] },
         nodeConfig: { nodeId: 'implement', mcp: 'mcp.json' },
       };
-      const { provider, server } = providerWith({ configuredServers: ['posthog'] });
+      const { provider, server } = providerWith({
+        configuredServers: ['posthog'],
+        mcpStatusPages: [[{ name: 'local', pluginId: null, runtimeStatus: 'connected' }]],
+      });
       for await (const _ of provider.sendQuery('p', dir, undefined, options)) {
         // consume
       }
@@ -1295,6 +1385,90 @@ describe('CodexProvider', () => {
       });
     });
 
+    test.each(['explicit', 'workflow', 'split'] as const)(
+      'sends satisfiable conditional output through the %s path',
+      async path => {
+        const conditional = {
+          type: 'object',
+          additionalProperties: false,
+          properties: { status: { type: 'string' }, message: { type: 'string' } },
+          required: ['status', 'message'],
+          oneOf: ['success', 'blocked'].map(status => ({
+            properties: { status: { const: status } },
+          })),
+        };
+        const { provider, server } = providerWith();
+        await run(provider, {
+          ...(path === 'explicit'
+            ? { outputFormat: { type: 'json_schema', schema: conditional } as const }
+            : {}),
+          nodeConfig: { output_format: path === 'explicit' ? schema : conditional },
+          ...(path === 'split'
+            ? {
+                assistantConfig: { model: 'glm-5.3', toolFreeStructuredOutputModels: ['glm-5.3'] },
+              }
+            : {}),
+        });
+        expect(server.processes).toHaveLength(path === 'split' ? 2 : 1);
+        if (path === 'split') {
+          expect(
+            server.processes[0].requests.find(r => r.method === 'turn/start')?.params
+          ).not.toHaveProperty('outputSchema');
+        }
+        const outgoing = paramsOf(server, 'turn/start')?.outputSchema;
+        expect(outgoing).toBeDefined();
+        if (outgoing === null || typeof outgoing !== 'object')
+          throw new Error('Missing output schema');
+        const validate = new Ajv({ strict: false }).compile(outgoing);
+        expect(validate({ status: 'success', message: 'Finished' })).toBe(true);
+        expect(validate({ status: 'blocked', message: 'Need access' })).toBe(true);
+        expect(validate({ status: 'success' })).toBe(false);
+        expect(validate({ status: 'unknown', message: 'Finished' })).toBe(false);
+      }
+    );
+
+    test.each(['explicit', 'workflow', 'split'] as const)(
+      'rejects unsupported conditional schemas before starting Codex through the %s path',
+      async path => {
+        const parent = {
+          type: 'object',
+          properties: { status: { type: 'string' }, message: { type: 'string' } },
+          required: ['status', 'message'],
+        };
+        for (const unsupported of [
+          { ...parent, oneOf: [{ $ref: '#/external' }] },
+          { ...parent, allOf: [{ properties: { status: { const: 'success' } } }] },
+          { ...parent, dependentRequired: { status: ['message'] } },
+          { ...parent, dependentSchemas: { status: true } },
+          {
+            properties: { payload: { properties: { a: true }, required: ['a'] } },
+            required: ['payload'],
+            anyOf: [{ properties: { payload: { properties: { b: true }, required: ['b'] } } }],
+          },
+        ]) {
+          const { provider, server } = providerWith();
+          const result = resultOf(
+            await run(provider, {
+              ...(path === 'explicit'
+                ? { outputFormat: { type: 'json_schema', schema: unsupported } as const }
+                : { nodeConfig: { output_format: unsupported } }),
+              ...(path === 'split'
+                ? {
+                    assistantConfig: {
+                      model: 'glm-5.3',
+                      toolFreeStructuredOutputModels: ['glm-5.3'],
+                    },
+                  }
+                : {}),
+            })
+          );
+          expect(result.isError).toBe(true);
+          expect(result.failure?.evidence).toContain('complete inline');
+          expect(server.processes).toHaveLength(0);
+        }
+      }
+    );
+
     test('parses the last message onto structuredOutput (workflow output_format path)', async () => {
       const chunks = await streamOf(
         {
@@ -1322,6 +1496,108 @@ describe('CodexProvider', () => {
     test('leaves structuredOutput unset when no format was requested', async () => {
       const chunks = await streamOf({ notifications: [agentMessage('{"a":1}')] });
       expect(resultOf(chunks).structuredOutput).toBeUndefined();
+    });
+
+    describe('on a model that cannot take tools and a schema together', () => {
+      const options = (model: string): SendQueryOptions => ({
+        assistantConfig: { model, toolFreeStructuredOutputModels: ['glm-5.3'] },
+        nodeConfig: { nodeId: 'review', output_format: schema },
+      });
+      const toolTurn: FakeTurnScript = {
+        notifications: [
+          agentMessage('Found a missing null check.', 'm-1'),
+          tokenUsage({ input: 100, output: 10 }),
+        ],
+      };
+      const finalTurn: FakeTurnScript = {
+        notifications: [
+          agentMessage('{"summary":"missing null check"}', 'm-2'),
+          tokenUsage({ input: 150, output: 15 }, { input: 50, output: 5 }),
+        ],
+      };
+      const scripted = (...turns: FakeTurnScript[]): (() => FakeTurnScript) => {
+        let index = 0;
+        return () => turns[index++] ?? {};
+      };
+
+      test('runs the tools without the schema, then one tool-free turn on the same thread with it', async () => {
+        const { provider, server } = providerWith(scripted(toolTurn, finalTurn));
+        const chunks = await run(provider, options('glm-5.3'));
+
+        expect(server.processes).toHaveLength(2);
+        const [first, second] = server.processes.map(
+          ({ requests }) =>
+            (method: string) =>
+              requests.find(r => r.method === method)?.params
+        );
+        expect(first('thread/start')?.config).toMatchObject({ features: { multi_agent: false } });
+        expect(first('turn/start')).not.toHaveProperty('outputSchema');
+        expect(second('thread/resume')).toMatchObject({
+          threadId: THREAD_ID,
+          config: TOOL_FREE_THREAD_CONFIG,
+        });
+        const [, catalogFlag, catalogArg] = server.processes[1].args;
+        expect(catalogFlag).toBe('-c');
+        expect(catalogArg).toStartWith('model_catalog_json=');
+        // The final turn's catalog file lives only as long as the call.
+        const catalogPath = JSON.parse(catalogArg.slice('model_catalog_json='.length)) as string;
+        expect(existsSync(catalogPath)).toBe(false);
+        expect(second('turn/start')).toMatchObject({
+          outputSchema: { required: ['summary'], additionalProperties: false },
+        });
+        expect(chunks).toContainEqual(
+          expect.objectContaining({
+            type: 'agent_message_chunk',
+            text: expect.stringContaining('Found a missing null check.'),
+          })
+        );
+        const result = resultOf(chunks);
+        expect(result.structuredOutput).toEqual({ summary: 'missing null check' });
+        expect(result.tokens).toMatchObject({ input: 150, output: 15 });
+        expect(result.resumed).toBeUndefined();
+        expect(chunks.at(-1)).toEqual({ type: 'settled' });
+      });
+
+      test('a failed tool turn is the result, and no final turn runs', async () => {
+        const { provider, server } = providerWith(
+          scripted({
+            ...toolTurn,
+            completion: { status: 'failed', error: turnError(null, 'boom') },
+          })
+        );
+        expect(resultOf(await run(provider, options('glm-5.3'))).failure).toBeDefined();
+        expect(server.processes).toHaveLength(1);
+      });
+
+      test('a final turn that ends by a process exit still reports the tool turn usage', async () => {
+        const { provider, server } = providerWith(scripted(toolTurn, { exitCode: 1 }));
+        const result = resultOf(await run(provider, options('glm-5.3')));
+        expect(server.processes).toHaveLength(2);
+        expect(result.failure).toBeDefined();
+        expect(result.tokens).toMatchObject({ input: 100, output: 10 });
+      });
+
+      test('a tool turn process that exited abnormally never settles, even when the final turn then fails', async () => {
+        const server = createFakeAppServer(
+          scripted(
+            { ...toolTurn, stdinCloseExitCode: 1 },
+            { errors: { 'thread/resume': { code: -32603, message: 'resume failed' } } }
+          )
+        );
+        const chunks = await run(new CodexProvider(server, 20), options('glm-5.3'));
+        expect(server.processes).toHaveLength(2);
+        expect(resultOf(chunks).failure).toBeDefined();
+        expect(chunks.some(chunk => chunk.type === 'settled')).toBe(false);
+      });
+
+      test('another model keeps one turn with tools and the schema together', async () => {
+        const { provider, server } = providerWith(scripted(finalTurn));
+        const chunks = await run(provider, options('gpt-5.5'));
+        expect(server.processes).toHaveLength(1);
+        expect(paramsOf(server, 'turn/start')?.outputSchema).toBeDefined();
+        expect(paramsOf(server, 'thread/start')?.config).not.toHaveProperty('features.multi_agent');
+        expect(resultOf(chunks).structuredOutput).toEqual({ summary: 'missing null check' });
+      });
     });
   });
 
@@ -1683,7 +1959,7 @@ describe('CodexProvider', () => {
       expect(result.failure?.evidence).toContain(
         'Model "gpt-5.3-codex" is not available for your account'
       );
-      expect(result.failure?.evidence).toContain('model: gpt-5.6-sol');
+      expect(result.failure?.evidence).toContain('model: gpt-6.1-sol');
       expect(result.failure?.evidence).toContain('403 Forbidden: model not available');
     });
 
@@ -2069,4 +2345,118 @@ test('Codex diagnostics carry binary resolution and legacy setup posture without
     if (previous === undefined) delete process.env.CODEX_ID_TOKEN;
     else process.env.CODEX_ID_TOKEN = previous;
   }
+});
+
+test('a declared MCP server that fails to connect names the server and blocks turn/start', async () => {
+  const dir = trackTempRoot(await mkdtemp(join(tmpdir(), 'codex-mcp-ready-')));
+  const mcp = join(dir, 'mcp.json');
+  await writeFile(mcp, JSON.stringify({ declared: { command: 'missing' } }));
+  const { provider, server } = providerWith({
+    mcpStatusPages: [
+      [{ name: 'declared', pluginId: null, runtimeStatus: 'failed', toolsError: 'spawn ENOENT' }],
+    ],
+  });
+  const chunks = await run(provider, { nodeConfig: { nodeId: 'test', mcp } });
+  expect(paramsOf(server, 'turn/start')).toBeUndefined();
+  expect(resultOf(chunks).failure).toEqual({
+    class: 'misconfigured',
+    evidence: expect.stringContaining('declared'),
+  });
+  expect(resultOf(chunks).failure?.evidence).toContain('spawn ENOENT');
+});
+
+test('a declared MCP server whose status this Codex version does not list blocks turn/start', async () => {
+  const dir = trackTempRoot(await mkdtemp(join(tmpdir(), 'codex-mcp-unknown-')));
+  const mcp = join(dir, 'mcp.json');
+  await writeFile(mcp, JSON.stringify({ declared: { command: 'fixture' } }));
+  const { provider, server } = providerWith({
+    mcpStatusPages: [
+      [{ name: 'declared', pluginId: null, runtimeStatus: 'suspended' as 'connected' }],
+    ],
+  });
+  const chunks = await run(provider, { nodeConfig: { nodeId: 'test', mcp } });
+  expect(paramsOf(server, 'turn/start')).toBeUndefined();
+  expect(resultOf(chunks).failure).toEqual({
+    class: 'misconfigured',
+    evidence:
+      'Cannot establish connection readiness for MCP server "declared": unknown runtime status',
+  });
+});
+
+for (const continuation of ['fresh', 'resume', 'fork'] as const) {
+  test(`required MCP connects before a ${continuation} turn, across status pages`, async () => {
+    const dir = trackTempRoot(await mkdtemp(join(tmpdir(), 'codex-mcp-connected-')));
+    const mcp = join(dir, 'mcp.json');
+    await writeFile(mcp, JSON.stringify({ declared: { command: 'fixture' } }));
+    const { provider, server } = providerWith({
+      mcpStatusPages: [[], [{ name: 'declared', pluginId: null, runtimeStatus: 'connected' }]],
+    });
+    const chunks = await run(
+      provider,
+      {
+        nodeConfig: { nodeId: 'test', mcp },
+        forkSession: continuation === 'fork',
+      },
+      continuation === 'fresh' ? undefined : THREAD_ID
+    );
+    expect(resultOf(chunks).isError).not.toBe(true);
+    expect(chunks).toContainEqual({
+      type: 'mcp_server_status',
+      server: 'declared',
+      status: 'connected',
+    });
+    const methods = server.processes[0].requests.map(r => r.method);
+    expect(methods.indexOf('turn/start')).toBeGreaterThan(
+      methods.lastIndexOf('mcpServerStatus/list')
+    );
+  });
+}
+
+for (const [name, definition] of [
+  ['declared', {}],
+  ['declared', { unknown: 'ignored' }],
+  ['declared', { command: null }],
+  ['', {}],
+] as const) {
+  test(`untranslatable MCP server ${JSON.stringify(name)}: ${JSON.stringify(definition)}`, async () => {
+    const dir = trackTempRoot(await mkdtemp(join(tmpdir(), 'codex-mcp-empty-')));
+    const mcp = join(dir, 'mcp.json');
+    await writeFile(mcp, JSON.stringify({ [name]: definition }));
+    const { provider, server } = providerWith({});
+    const chunks = await run(provider, { nodeConfig: { nodeId: 'test', mcp } });
+    expect(paramsOf(server, 'turn/start')).toBeUndefined();
+    expect(resultOf(chunks).failure).toEqual({
+      class: 'misconfigured',
+      evidence: expect.stringContaining(`Required MCP server "${name}"`),
+    });
+  });
+}
+
+test('an empty required MCP file map admits a turn', async () => {
+  const dir = trackTempRoot(await mkdtemp(join(tmpdir(), 'codex-mcp-empty-map-')));
+  const mcp = join(dir, 'mcp.json');
+  await writeFile(mcp, '{}');
+  const { provider, server } = providerWith({});
+  const chunks = await run(provider, {
+    nodeConfig: { nodeId: 'test', mcp },
+  });
+  expect(paramsOf(server, 'turn/start')).toBeDefined();
+  expect(resultOf(chunks).isError).not.toBe(true);
+});
+
+test('a dropped MCP name cannot be supplied by Object.prototype beside a valid server', async () => {
+  const dir = trackTempRoot(await mkdtemp(join(tmpdir(), 'codex-mcp-own-name-')));
+  const mcp = join(dir, 'mcp.json');
+  await writeFile(mcp, JSON.stringify({ constructor: {}, declared: { command: 'fixture' } }));
+  const { provider, server } = providerWith({
+    mcpStatusPages: [[{ name: 'declared', pluginId: null, runtimeStatus: 'connected' }]],
+  });
+  const chunks = await run(provider, {
+    nodeConfig: { nodeId: 'test', mcp },
+  });
+  expect(paramsOf(server, 'turn/start')).toBeUndefined();
+  expect(resultOf(chunks).failure).toEqual({
+    class: 'misconfigured',
+    evidence: expect.stringContaining('constructor'),
+  });
 });

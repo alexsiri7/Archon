@@ -1,12 +1,21 @@
 // @archon-test-isolated
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { access, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, sep, resolve } from 'node:path';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import { Codebase } from '../types';
 import { quoteCommandArg } from '../utils/command-args';
 import { getArchonWorkspacesPath } from '@archon/paths';
 
 const mockQuery = createMockQuery();
+let transactionOpen = false;
+// SQLite can replay a transaction body after COMMIT; a test sets this to replay it.
+let transactionRuns = 1;
+// Rejects the transaction after its body ran, like a failed COMMIT.
+let transactionFailure: Error | undefined;
+const trackTempRoot = trackTempRoots();
 
 // Mock the connection module before importing the module under test
 mock.module('./connection', () => ({
@@ -14,7 +23,17 @@ mock.module('./connection', () => ({
     query: mockQuery,
   },
   getDatabase: () => ({
-    withTransaction: <T>(fn: (query: typeof mockQuery) => Promise<T>): Promise<T> => fn(mockQuery),
+    withTransaction: async <T>(fn: (query: typeof mockQuery) => Promise<T>): Promise<T> => {
+      transactionOpen = true;
+      try {
+        let result = await fn(mockQuery);
+        for (let run = 1; run < transactionRuns; run++) result = await fn(mockQuery);
+        if (transactionFailure) throw transactionFailure;
+        return result;
+      } finally {
+        transactionOpen = false;
+      }
+    },
   }),
   getDatabaseType: () => 'postgresql',
   getDialect: () => mockPostgresDialect,
@@ -44,6 +63,8 @@ import {
 describe('codebases', () => {
   beforeEach(() => {
     mockQuery.mockClear();
+    transactionRuns = 1;
+    transactionFailure = undefined;
   });
 
   const mockCodebase: Codebase = {
@@ -81,7 +102,6 @@ describe('codebases', () => {
       () => findCodebaseByRepoUrl('url'),
       () => findCodebaseByDefaultCwd('projects/repo'),
       () => listCodebases(),
-      () => findCodebaseByPathPrefix(resolve('projects/repo')),
     ];
     for (const [index, read] of readers.entries()) {
       test(`reader ${index} rejects legacy values without guessing`, async () => {
@@ -195,9 +215,12 @@ describe('codebases', () => {
   });
 
   test.each(['registered', 'unregistered'])(
-    'checkout cleanup shares the registration lock for a %s checkout',
+    'checkout cleanup takes the registration lock and removes a %s checkout only after release',
     async state => {
       const owned = state === 'registered';
+      const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'codebase-cleanup-')));
+      const checkout = join(root, 'checkout');
+      await mkdir(checkout);
       mockQuery
         .mockResolvedValueOnce(createQueryResult([]))
         .mockResolvedValueOnce(createQueryResult([]))
@@ -207,18 +230,70 @@ describe('codebases', () => {
       mockQuery.mockClear();
       mockQuery
         .mockResolvedValueOnce(createQueryResult([]))
-        .mockResolvedValueOnce(createQueryResult(owned ? [mockCodebase] : []));
-      const remove = mock(async () => {
-        expect(mockQuery.mock.calls[0]).toEqual(registrationLock);
+        .mockResolvedValueOnce(
+          createQueryResult(owned ? [{ ...mockCodebase, default_cwd: checkout }] : [])
+        );
+      const remove = mock(async (detached: string) => {
+        expect(transactionOpen).toBe(false);
+        expect(detached).not.toBe(checkout);
+        await rm(detached, { recursive: true });
       });
 
-      await removeUnregisteredCheckout(mockCodebase.default_cwd, remove);
+      await removeUnregisteredCheckout(checkout, remove);
 
       expect(registrationLock?.[0]).toContain('pg_advisory_xact_lock');
       expect(mockQuery.mock.calls[0]).toEqual(registrationLock);
       expect(remove).toHaveBeenCalledTimes(owned ? 0 : 1);
+      if (owned) await access(checkout);
+      else await expect(access(checkout)).rejects.toMatchObject({ code: 'ENOENT' });
     }
   );
+
+  test('checkout cleanup detaches and removes a checkout once when the transaction replays', async () => {
+    const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'codebase-cleanup-')));
+    const checkout = join(root, 'checkout');
+    await mkdir(checkout);
+    transactionRuns = 2;
+    const remove = mock(async (detached: string) => {
+      await rm(detached, { recursive: true });
+    });
+
+    await removeUnregisteredCheckout(checkout, remove);
+
+    expect(remove).toHaveBeenCalledTimes(1);
+    await expect(access(checkout)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  test('checkout cleanup removes the detached checkout when the transaction fails after the move', async () => {
+    const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'codebase-cleanup-')));
+    const checkout = join(root, 'checkout');
+    await mkdir(checkout);
+    transactionFailure = new Error('commit failed');
+    const remove = mock(async (detached: string) => {
+      await rm(detached, { recursive: true });
+    });
+
+    await expect(removeUnregisteredCheckout(checkout, remove)).rejects.toBe(transactionFailure);
+
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  test('checkout cleanup keeps the transaction error when removing the detached checkout fails', async () => {
+    const root = trackTempRoot(await mkdtemp(join(tmpdir(), 'codebase-cleanup-')));
+    const checkout = join(root, 'checkout');
+    await mkdir(checkout);
+    transactionFailure = new Error('commit failed');
+    const removeFailure = new Error('rm failed');
+
+    const failure = await removeUnregisteredCheckout(checkout, async () => {
+      throw removeFailure;
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([transactionFailure, removeFailure]);
+    expect((failure as AggregateError).cause).toBe(transactionFailure);
+  });
 
   describe('getCodebase', () => {
     test('returns existing codebase', async () => {
@@ -253,6 +328,24 @@ describe('codebases', () => {
       { ...mockCodebase, id: 'under', default_cwd: P('my_app') },
       { ...mockCodebase, id: 'svc', default_cwd: P('platform', 'svc-a') },
     ];
+
+    for (const path of ['projects/repo', '', './repo', '~/repo']) {
+      test(`ignores unrelated legacy path ${JSON.stringify(path)} when ranking ancestors`, async () => {
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([{ ...mockCodebase, default_cwd: path }, ...rows])
+        );
+        expect((await findCodebaseByPathPrefix(P('platform', 'svc-a', 'deep')))?.id).toBe('svc');
+      });
+    }
+
+    test('never interprets a relative stored path as ownership', async () => {
+      for (const cwd of ['projects/repo/subdir', resolve('projects/repo/subdir')]) {
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([{ ...mockCodebase, default_cwd: 'projects/repo' }])
+        );
+        expect(await findCodebaseByPathPrefix(cwd)).toBeNull();
+      }
+    });
 
     test('matches an exact default_cwd', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult(rows));
@@ -456,9 +549,20 @@ describe('codebases', () => {
       expect(result).toBeDefined();
       expect(result?.name).toBe('test-repo');
       expect(mockQuery).toHaveBeenCalledWith(
-        'SELECT * FROM remote_agent_codebases WHERE default_cwd = $1 ORDER BY created_at DESC LIMIT 1',
-        ['/workspace/test-repo']
+        'SELECT * FROM remote_agent_codebases ORDER BY created_at DESC'
       );
+    });
+
+    test('returns the newest row whose default_cwd matches, skipping others', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { ...mockCodebase, id: 'other', default_cwd: '/workspace/other' },
+          { ...mockCodebase, id: 'newer', default_cwd: '/workspace/test-repo' },
+          { ...mockCodebase, id: 'older', default_cwd: '/workspace/test-repo' },
+        ])
+      );
+
+      expect((await findCodebaseByDefaultCwd('/workspace/test-repo'))?.id).toBe('newer');
     });
 
     test('should return null when codebase not found', async () => {
@@ -590,19 +694,23 @@ describe('codebases', () => {
       mockQuery
         .mockResolvedValueOnce(createQueryResult([adoCodebase]))
         .mockResolvedValueOnce(createQueryResult([]))
+        .mockResolvedValueOnce(createQueryResult([{ name: 'other' }]))
         .mockResolvedValueOnce(createQueryResult([], 1))
         .mockResolvedValueOnce(createQueryResult([{ ...adoCodebase, name: 'qes' }]));
 
       const renamed = await renameCodebase(adoCodebase.id, 'qes');
 
       expect(renamed.name).toBe('qes');
-      // The PostgreSQL rename lock is taken before the conditional UPDATE.
+      // The PostgreSQL identity lock is taken before the duplicate check reads names.
       expect(mockQuery.mock.calls[1]?.[0]).toBe(
         'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))'
       );
+      expect(mockQuery.mock.calls[2]).toEqual([
+        'SELECT name FROM remote_agent_codebases WHERE id <> $1',
+        [adoCodebase.id],
+      ]);
       expect(mockQuery).toHaveBeenCalledWith(
-        'UPDATE remote_agent_codebases SET name = $1, updated_at = NOW() WHERE id = $2 ' +
-          'AND NOT EXISTS (SELECT 1 FROM remote_agent_codebases WHERE name = $1 AND id <> $2)',
+        'UPDATE remote_agent_codebases SET name = $1, updated_at = NOW() WHERE id = $2',
         ['qes', adoCodebase.id]
       );
     });
@@ -620,25 +728,24 @@ describe('codebases', () => {
       await expect(renameCodebase('missing', 'qes')).rejects.toBeInstanceOf(CodebaseNotFoundError);
     });
 
-    test('rejects a name another codebase already uses', async () => {
-      // The conditional UPDATE matches nothing while the codebase still exists.
+    test('rejects a name another codebase uses in any case, without updating', async () => {
       mockQuery
         .mockResolvedValueOnce(createQueryResult([adoCodebase]))
         .mockResolvedValueOnce(createQueryResult([]))
-        .mockResolvedValueOnce(createQueryResult([], 0))
-        .mockResolvedValueOnce(createQueryResult([adoCodebase]));
+        .mockResolvedValueOnce(createQueryResult([{ name: 'QES' }]));
 
       await expect(renameCodebase(adoCodebase.id, 'qes')).rejects.toBeInstanceOf(
         CodebaseNameTakenError
       );
+      expect(mockQuery).toHaveBeenCalledTimes(3);
     });
 
     test('throws CodebaseNotFoundError when the codebase disappears before the update', async () => {
       mockQuery
         .mockResolvedValueOnce(createQueryResult([adoCodebase]))
         .mockResolvedValueOnce(createQueryResult([]))
-        .mockResolvedValueOnce(createQueryResult([], 0))
-        .mockResolvedValueOnce(createQueryResult([]));
+        .mockResolvedValueOnce(createQueryResult([]))
+        .mockResolvedValueOnce(createQueryResult([], 0));
 
       await expect(renameCodebase(adoCodebase.id, 'qes')).rejects.toBeInstanceOf(
         CodebaseNotFoundError

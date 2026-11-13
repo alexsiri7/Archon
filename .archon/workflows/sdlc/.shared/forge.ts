@@ -1,15 +1,8 @@
 /**
- * Standalone client for `archon forge`, the pack's opt-in forge source.
- *
- * One switch selects the source for every forge read and write this pack makes:
- *
- *   gh     the default. The GitHub CLI.
- *   forge  opt-in with `ARCHON_SDLC_FORGE=forge`. An installed forge plugin,
- *          reached through the host command (`ARCHON_CLI_COMMAND`).
- *
- * The source is never inferred from what happens to be installed, and a selected
- * source that cannot answer fails the operation rather than falling back to the
- * other.
+ * Standalone client for `archon forge`, the one way this pack reads and writes the
+ * forge. Every operation goes through an installed forge plugin, reached through the
+ * host command (`ARCHON_CLI_COMMAND`). A plugin that cannot answer fails the
+ * operation; nothing falls back to another CLI.
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -17,24 +10,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { note } from './io.ts';
 
-export const FORGE_SOURCES = ['gh', 'forge'] as const;
-export type ForgeSource = (typeof FORGE_SOURCES)[number];
-
-// Read here, not in each calling script: the unbound-env checker scans a node-bound
-// script's own text but never follows its imports, so a bare process.env read in a
-// shared module like this one never trips a false "unbound variable" warning.
-export function forgeSource(env: NodeJS.ProcessEnv = process.env): ForgeSource {
-  const selected = (env.ARCHON_SDLC_FORGE ?? '').trim();
-  if (selected === '') return 'gh';
-  const source = FORGE_SOURCES.find(source => source === selected);
-  if (source) return source;
-  throw new Error(`ARCHON_SDLC_FORGE must be "gh" (the default) or "forge", not "${selected}"`);
-}
-
 /** The GitHub forge plugin install id. */
 export const GITHUB_FORGE_PLUGIN = 'coleam00/Archon/plugins/forge-github';
 
-const USE_GH = 'To use the GitHub CLI instead, set `ARCHON_SDLC_FORGE=gh`.';
 // Per-user GitHub mode scrubs the shared token from a run started by a user who has
 // not connected their own identity, so a shared `GH_TOKEN` cannot fix that refusal.
 const SETUP =
@@ -43,8 +21,7 @@ const SETUP =
   "Archon's env file (`~/.archon/.env`, `ARCHON_HOME/.env` when configured, or `/.archon/.env` in Docker), " +
   'set `GITHUB_TOKEN`, use `gh auth login`, or configure GitHub App mode. When per-user GitHub ' +
   'is enabled, connect your own GitHub identity instead of setting `GH_TOKEN`: ' +
-  '`archon auth github`, `/archon connect github` in Slack, or the Web UI Settings page. ' +
-  USE_GH;
+  '`archon auth github` or the Web UI Settings page.';
 
 /**
  * The operator's next step for each refusal the forge contract types as their setup's,
@@ -55,8 +32,7 @@ export const REMEDY = {
   no_credential: SETUP,
   unsupported_op:
     `For github.com, \`archon plugin update ${GITHUB_FORGE_PLUGIN}\` installs the ` +
-    'latest released plugin, which may not support this operation either. ' +
-    USE_GH,
+    'latest released plugin, which may not support this operation either.',
 } as const;
 
 export interface QualifiedPr {
@@ -241,7 +217,7 @@ export function forgeResult(
   return value;
 }
 
-function qualifiedRepo(value: unknown): QualifiedPr['repo'] | undefined {
+export function qualifiedRepo(value: unknown): QualifiedPr['repo'] | undefined {
   const repo = record(value);
   return typeof repo?.host === 'string' &&
     repo.host.trim() !== '' &&

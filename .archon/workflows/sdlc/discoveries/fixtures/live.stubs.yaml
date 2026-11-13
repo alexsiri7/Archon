@@ -4,7 +4,6 @@
 facts:
   path: decide
   base: { branch: dev, sha: "stub-sha" }
-  policy_defaults: "/stub/policy"
 decide:
   decisions:
     - outcome: file
@@ -27,7 +26,6 @@ decide:
       reason: "stub: fixed at the base"
   summary: "stub: 3 records, one of each."
 outcome:
-  mode: live
   summary: "stub: 3 records, one of each."
   written:
     - { key: stub-new-defect, outcome: file, url: "https://github.com/example/repo/issues/9" }
@@ -35,7 +33,6 @@ outcome:
   dropped: [{ key: stub-fixed-defect, reason: "stub: fixed at the base" }]
   asked: []
   question: ""
-  evaluation: null
 fixture:
   inputs: { repo_host: github.com, repo_path: example/repo }
   expect: completed

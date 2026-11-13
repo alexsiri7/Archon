@@ -59,6 +59,9 @@ The project rail is the main navigation surface:
   project opens its scoped runs at `/console/p/:projectId`.
 - **Chat** at `/console/p/:projectId/chat` opens the operator conversation for
   that project.
+- **Metrics** at `/console/metrics` shows the [metrics](/guides/metrics/) workflows
+  recorded across projects; a project's Metrics tab at
+  `/console/p/:projectId/metrics` scopes them to that project.
 - **Settings** at `/console/settings` manages assistant defaults, model tiers,
   aliases, provider credentials, system status, GitHub identity, and alerts.
 - **Workflow builder** at `/console/builder` opens the experimental visual
@@ -117,7 +120,7 @@ artifact.
 
 ## Further reading
 
-- [Getting Started](/getting-started/overview/)
+- [Quickstart](/getting-started/quick-start/)
 - [Configuration](/getting-started/configuration/)
-- [Authoring Workflows](/guides/authoring-workflows/)
+- [Workflow language](/reference/workflow-language/)
 - [API Reference](/reference/api/)

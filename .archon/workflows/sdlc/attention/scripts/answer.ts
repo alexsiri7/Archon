@@ -14,19 +14,18 @@
  */
 
 import { type Answered, previousAnswer } from '../../.shared/attention.ts';
-import { forgeSource } from '../../.shared/forge.ts';
 import { emit, refuse, text } from '../../.shared/io.ts';
-import { setPrDraft } from '../../.shared/pr.ts';
+import { isFailureReason, setPrDraft } from '../../.shared/pr.ts';
 
 /**
  * A failure before a block's terminal node skips it and leaves no outcome; deliver and
- * ship still report, with reason `failed`.
+ * ship still report, with reason `failed` or `pr_create_unresolved`.
  */
 function judged(outcome: string, applied: string): Answered {
   const parsed = outcome.trim() === '' ? null : (JSON.parse(outcome) as unknown);
   const failed =
     parsed === null ||
-    (typeof parsed === 'object' && 'reason' in parsed && parsed.reason === 'failed');
+    (typeof parsed === 'object' && 'reason' in parsed && isFailureReason(parsed.reason));
   return { judge: !failed, outcome: parsed, applied };
 }
 
@@ -41,7 +40,7 @@ function main(): void {
   }
   // settle refuses a `ready` choice without a pull request.
   if (asked.pull_request === null) throw new Error('the `ready` answer names no pull request');
-  const pr = setPrDraft(asked.pull_request, false, forgeSource());
+  const pr = setPrDraft(asked.pull_request, false);
   emit({ judge: false, outcome: answered.outcome, applied: `${pr.url} is ready for review.` });
 }
 

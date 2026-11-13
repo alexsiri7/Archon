@@ -11,6 +11,11 @@ export {
   type ProviderFailureClass,
 } from './failure';
 export {
+  providerLifecycleEventSchema,
+  providerLifecycleWaitedMsSchema,
+  type ProviderLifecycleEvent,
+} from './lifecycle';
+export {
   credentialSourceSchema,
   credentialStatusSchema,
   type CredentialSource,
@@ -33,6 +38,7 @@ export {
   agentThoughtChunkSchema,
   compactionSchema,
   hookSchema,
+  heartbeatSchema,
   mcpServerStatusSchema,
   providerChunkSchema,
   providerEventSchema,
@@ -51,7 +57,7 @@ export {
   type ProviderEvent,
   type ProviderWarning,
 } from './events';
-export { providerSettledSchema, type ProviderSettled } from './settled';
+export { awaitingTurnSettlement, providerSettledSchema, type ProviderSettled } from './settled';
 export { providerCapabilitiesSchema, type ProviderCapabilities } from './capabilities';
 
 export {
@@ -65,6 +71,7 @@ export { addResultUsage, mergeTokenUsage, type ResultUsageTotal } from './result
 export {
   isObjectSchemaNode,
   findStrictSchemaIssues,
+  visitJsonSchema,
   type StrictSchemaIssue,
 } from './output-schema';
 export {
@@ -148,3 +155,9 @@ export {
 } from './config-schema';
 
 export { nativeToolInputParser } from './native-tools';
+
+export {
+  normalizeJsonSchemaForOpenAiStrict,
+  findPreparedStrictSchemaIssues,
+  type PreparedStrictSchemaIssue,
+} from './strict-output-schema';

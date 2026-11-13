@@ -1,7 +1,8 @@
-import { realpath, stat } from 'node:fs/promises';
-import { isAbsolute, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { realpath, rename, stat } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getGitCheckoutIdentity } from '@archon/git';
+import { getGitCheckoutIdentity, GitFailure } from '@archon/git';
 import {
   createLogger,
   isPathInside,
@@ -28,28 +29,91 @@ async function existingPhysicalPath(path: string): Promise<string | null> {
   }
 }
 
-export async function isCheckoutRegistered(
+async function isCheckoutRegistered(
   path: string,
-  registered: readonly Pick<ProjectIdentity, 'kind' | 'name' | 'default_cwd'>[]
+  registered: RegisteredProjects
 ): Promise<boolean> {
   const checkout = (await existingPhysicalPath(path)) ?? resolve(path);
   for (const project of registered) {
-    // An invalid relative stored path names no checkout; resolving it would claim this process's directory.
-    if (!isAbsolute(project.default_cwd)) continue;
-    const physicalCwd = await readablePhysicalPath(project);
-    const cwd = physicalCwd ?? resolve(project.default_cwd);
-    if (
-      isPathInside(checkout, cwd, { includeRoot: true }) ||
-      isPathInside(cwd, checkout, { includeRoot: true })
-    )
-      return true;
-    if (project.kind !== 'folder' && physicalCwd) {
-      for (const metadata of await readableGitMetadata(physicalCwd)) {
-        if (isPathInside(checkout, metadata, { includeRoot: true })) return true;
-      }
-    }
+    if (await projectClaimsCheckout(project, checkout)) return true;
   }
   return false;
+}
+
+type RegisteredProjects = readonly Pick<ProjectIdentity, 'kind' | 'name' | 'default_cwd'>[];
+
+/**
+ * `locked` holds the registration lock and calls `detachIfUnregistered` once it may read the
+ * registrations; an unregistered checkout moves to a hidden sibling no registration names.
+ * `remove` deletes the moved checkout after `locked` settles, also when `locked` rejects after
+ * the move: moving it back could replace a checkout registered at `path` once the lock is gone.
+ */
+export async function removeCheckoutUnlessRegistered(
+  path: string,
+  remove: (detached: string) => Promise<void>,
+  locked: (
+    detachIfUnregistered: (readRegistered: () => Promise<RegisteredProjects>) => Promise<void>
+  ) => Promise<unknown>
+): Promise<void> {
+  let detached: string | undefined;
+  try {
+    await locked(async readRegistered => {
+      // SQLite may replay a transaction after COMMIT; the checkout must move only once.
+      if (detached) return;
+      if (!(await isCheckoutRegistered(path, await readRegistered()))) {
+        detached = await detachCheckout(path);
+      }
+    });
+  } catch (error) {
+    if (!detached) throw error;
+    const moved = detached;
+    await remove(moved).catch((removeError: unknown) => {
+      throw new AggregateError(
+        [error, removeError],
+        `${errorMessage(error)} Removing the checkout detached to ${moved} also failed: ${errorMessage(removeError)}`,
+        { cause: error }
+      );
+    });
+    throw error;
+  }
+  if (detached) await remove(detached);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * A same-directory rename is one short step under the registration lock, so the slow
+ * recursive delete can run after it.
+ */
+async function detachCheckout(path: string): Promise<string> {
+  const checkout = resolve(path);
+  const detached = join(dirname(checkout), `.${basename(checkout)}.removing-${randomUUID()}`);
+  await rename(checkout, detached);
+  return detached;
+}
+
+/**
+ * A project claims a checkout that contains, or sits inside, its path, and a repository
+ * also claims the Git directories its checkout keeps elsewhere.
+ */
+async function projectClaimsCheckout(
+  project: Pick<ProjectIdentity, 'kind' | 'name' | 'default_cwd'>,
+  checkout: string
+): Promise<boolean> {
+  // An invalid relative stored path names no checkout; resolving it would claim this process's directory.
+  if (!isAbsolute(project.default_cwd)) return false;
+  const physicalCwd = await readablePhysicalPath(project);
+  const cwd = physicalCwd ?? resolve(project.default_cwd);
+  if (
+    isPathInside(checkout, cwd, { includeRoot: true }) ||
+    isPathInside(cwd, checkout, { includeRoot: true })
+  )
+    return true;
+  if (project.kind === 'folder' || !physicalCwd) return false;
+  const metadata = await readableGitMetadata(physicalCwd);
+  return metadata.some(dir => isPathInside(checkout, dir, { includeRoot: true }));
 }
 
 /**
@@ -125,17 +189,26 @@ export function resolveRegistrationUrl(url: string, cwd: string): string {
   return value;
 }
 
+async function localRemoteIdentity(path: string): Promise<string> {
+  // Local targets without a repository retain their path identity: Git may
+  // rewrite that spelling to a repository elsewhere. Access errors still surface.
+  const physicalPath = await existingPhysicalPath(path);
+  if (!physicalPath) return `file:${path}`;
+  if (!(await stat(physicalPath)).isDirectory()) return `file:${physicalPath}`;
+  try {
+    const { commonGitDir } = await getGitCheckoutIdentity(physicalPath);
+    return `file:${await realpath(commonGitDir)}`;
+  } catch (error) {
+    if (error instanceof GitFailure && error.kind === 'not_repository')
+      return `file:${physicalPath}`;
+    throw error;
+  }
+}
+
 /** Compare transport spellings without conflating hosts, ports or case-sensitive repo paths. */
 export async function remoteIdentity(url: string, cwd = process.cwd()): Promise<string> {
   url = resolveRegistrationUrl(url, cwd);
-  // Missing local targets retain their stored spelling; access errors must surface.
-  if (isAbsolute(url)) {
-    const physicalPath = await existingPhysicalPath(url);
-    if (!physicalPath) return `file:${url}`;
-    if (!(await stat(physicalPath)).isDirectory()) return `file:${physicalPath}`;
-    const { commonGitDir } = await getGitCheckoutIdentity(physicalPath);
-    return `file:${await realpath(commonGitDir)}`;
-  }
+  if (isAbsolute(url)) return localRemoteIdentity(url);
   const cleaned = url
     .trim()
     .replace(/\/+$/, '')

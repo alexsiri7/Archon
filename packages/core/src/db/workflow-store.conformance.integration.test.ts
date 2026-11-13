@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { removeTempTree, trackTempRoots } from '@archon/paths/test-utils';
 import { describeWorkflowStoreConformance } from '@archon/workflows/store-conformance';
-import { makeSqlConformanceHarness } from './workflow-store.conformance-harness';
+import {
+  makeSqlConformanceHarness,
+  describeSqlStatusReadConformance,
+} from './workflow-store.conformance-harness';
 import { SqliteAdapter, sqliteDialect } from './adapters/sqlite';
 
 const trackTempRoot = trackTempRoots();
@@ -18,13 +21,17 @@ const makeHarness = async () => {
     await removeTempTree(root);
   };
   try {
-    return await makeSqlConformanceHarness(db, sqliteDialect, 'sqlite', close);
+    const harness = await makeSqlConformanceHarness(db, sqliteDialect, 'sqlite', close);
+    return { ...harness, db };
   } catch (error) {
     await close();
     throw error;
   }
 };
 describeWorkflowStoreConformance('SQLite', makeHarness);
+
+describeSqlStatusReadConformance(makeHarness);
+
 test('explicit deletion retains SQL feed payloads from an earlier cursor', async () => {
   const harness = await makeHarness();
   try {
@@ -44,3 +51,33 @@ test('explicit deletion retains SQL feed payloads from an earlier cursor', async
     await harness.close();
   }
 });
+
+test.each(['nested-workflow', null])(
+  'parent deletion preserves child provenance after metadata erasure attempts (node: %s)',
+  async marker => {
+    const harness = await makeHarness();
+    try {
+      const { store } = harness;
+      const parent = await store.createWorkflowRun({ workflow_name: 'parent', user_message: '' });
+      const child = await store.createWorkflowRun({
+        workflow_name: 'child',
+        user_message: '',
+        parent_run_id: parent.id,
+        metadata: marker === null ? {} : { parent_node_id: marker },
+      });
+      await store.claimPendingWorkflowRun(child.id);
+      await store.updateWorkflowRun(child.id, { metadata: { parent_node_id: null } });
+      expect(
+        await store.updateWorkflowRunMetadataIfRunning(child.id, { parent_node_id: 'replacement' })
+      ).toBe(true);
+      await store.cancelWorkflowRun(parent.id);
+      const { deleteWorkflowRun } = await import('./workflows');
+      await deleteWorkflowRun(parent.id);
+      const surviving = await store.getWorkflowRun(child.id);
+      expect(surviving?.parent_run_id).toBeNull();
+      expect(surviving?.metadata).toHaveProperty('parent_node_id', marker);
+    } finally {
+      await harness.close();
+    }
+  }
+);

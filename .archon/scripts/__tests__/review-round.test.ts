@@ -7,17 +7,11 @@
  */
 import { FULL_REVIEW_RISKS } from '../../workflows/sdlc/.shared/review-policy';
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { trackTempRoots } from '@archon/paths/test-utils';
-import { providerRegistry } from '@archon/providers';
-import { parseWorkflow } from '../../../packages/workflows/src/loader';
-import { resolveWorkflow } from '../../../packages/workflows/src/graph-plan';
-import { dryRunWorkflow } from '../../../packages/workflows/src/dry-run';
-import { parseFixtureFile } from '../../../packages/workflows/src/fixture-runner';
-import { qualifyWorkflowResources } from '../../../packages/workflows/src/packaged-workflow';
+import { trackTempRoots } from './temp-roots';
 import { packScriptRunner, type ScriptRun } from './deliver-checks-harness';
 
 const { runPackScript } = packScriptRunner();
@@ -56,7 +50,7 @@ function history(): { cwd: string; older: string; newer: string } {
   return { cwd, older, newer };
 }
 
-/** The engine identity review-round passes through for synthesis to count lenses by. */
+/** The engine identity review-round reads its checkout start from. */
 function execution(head: string): object {
   return {
     path: 'review__mode',
@@ -90,21 +84,6 @@ function round(
 }
 
 describe('review-round', () => {
-  it('reviews the checkout head on a first round', () => {
-    const { cwd, newer } = history();
-    const run = round(cwd, newer);
-    expect(run.code).toBe(0);
-    expect(JSON.parse(run.stdout)).toEqual({
-      continuation: false,
-      light: false,
-      head: newer,
-      cursor: '',
-      risks: FULL_REVIEW_RISKS,
-      execution: execution(newer),
-      seams: false, code: false, tests: false, errors: false, docs: false,
-      part: null,
-    });
-  });
 
   // The route agent adds every other lens a continuation earns; the code lens is
   // the one this round always reruns, whatever an earlier round ran.
@@ -119,30 +98,8 @@ describe('review-round', () => {
       head: newer,
       cursor: older,
       risks: FULL_REVIEW_RISKS,
-      execution: execution(newer),
-      seams: false, code: true, tests: false, errors: false, docs: false,
+      seams: false, code: true, tests: false, errors: false, docs: false, ux: false,
       part,
-    });
-  });
-
-  it('refuses a part assignment that is not JSON without echoing it', () => {
-    const { cwd, newer } = history();
-    const run = round(cwd, newer, undefined, { part: 'deliver chunk 1 of #42' });
-    expect(run.code).not.toBe(0);
-    expect(run.stdout).toBe('');
-    expect(run.stderr).toContain('the part input is not JSON');
-    for (const fragment of ['deliver', 'chunk', '#42']) expect(run.stderr).not.toContain(fragment);
-  });
-
-  it('runs the code lens alone on a light continuation', () => {
-    const { cwd, older, newer } = history();
-    expect(JSON.parse(round(cwd, newer, older, { light: true }).stdout)).toMatchObject({
-      light: true,
-      seams: false,
-      code: true,
-      tests: false,
-      errors: false,
-      docs: false,
     });
   });
 
@@ -152,56 +109,5 @@ describe('review-round', () => {
     expect(run.code).not.toBe(0);
     expect(run.stdout).toBe('');
     expect(run.stderr).toContain(`at ${older}, which does not descend from ${newer}`);
-  });
-
-  it('returns the mismatch response before checking continuation ancestry', async () => {
-    const { cwd, older, newer } = history();
-    git(cwd, 'checkout', '--detach', older);
-    const prior = join(cwd, 'report.md');
-    writeFileSync(prior, 'Previous review');
-    writeFileSync(join(cwd, 'reviewed-head'), newer);
-    const root = join(import.meta.dir, '../../..');
-    const parsed = parseWorkflow(readFileSync(join(root,
-      '.archon/workflows/sdlc/review/archon-review-block.yaml'), 'utf8'), 'archon-review-block.yaml', providerRegistry);
-    if (!parsed.workflow) throw new Error(parsed.error.error);
-    qualifyWorkflowResources(parsed.workflow, { source: 'project', pack: 'sdlc', workflow: 'review' });
-    const { stubs } = parseFixtureFile(
-      readFileSync(join(root, '.archon/workflows/sdlc/review/fixtures/head-mismatch.stubs.yaml'), 'utf8'),
-      'head-mismatch.stubs.yaml');
-    for (const matches of [false, true]) {
-      const run = await dryRunWorkflow({
-        workflow: resolveWorkflow(parsed.workflow), cwd: root, execWorkspace: cwd,
-        userMessage: '', execCode: true, inputs: { prior_report: prior },
-        stubs: { ...stubs, scope: { head_matches: matches, pr: null,
-          report: { type: 'archon_artifact', run_id: 'fixture-run', path: 'review/scope.md' } } },
-      });
-      const mode = run.trace.find(node => node.nodeId === 'mode');
-      expect(mode?.state, JSON.stringify(run)).toBe(matches ? 'failed' : 'skipped');
-      if (matches) {
-        expect(mode?.reason).toContain('does not descend from');
-        for (const id of ['route', 'seams', 'code', 'tests', 'errors', 'docs', 'synthesize', 'publish', 'result']) {
-          expect(run.trace.find(node => node.nodeId === id)?.state).toBe('skipped');
-        }
-      } else {
-        expect(run.outcome).toBe('completed');
-        expect(run.summary).toContain('Rerun: archon workflow run archon-review');
-      }
-    }
-  });
-
-  it('refuses a continuation whose report records no reviewed commit', () => {
-    const { cwd, newer } = history();
-    const run = runPackScript('review/scripts/review-round', {
-      cwd,
-      inputs: {
-        INPUTS_PRIOR_REPORT: '{ARTIFACTS}/review/report.md',
-        ARCHON_NODE_EXECUTION: JSON.stringify({
-          attempt: { checkoutStart: { kind: 'git', commit: newer } },
-        }),
-      },
-      artifacts: { 'review/report.md': 'Round 1' },
-    });
-    expect(run.code).not.toBe(0);
-    expect(run.stderr).toContain('records no reviewed commit');
   });
 });

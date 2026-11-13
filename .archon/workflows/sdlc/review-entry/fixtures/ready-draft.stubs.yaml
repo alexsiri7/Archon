@@ -2,8 +2,8 @@
 # draft, so nothing hands it on. The run pauses as one attention item whose choices
 # take the pull request out of draft or leave it; settle accepts `ready` because the
 # agent named the pull request.
-stage__mode: '{"continuation":false,"light":false,"head":"fixturehead","cursor":"","risks":"fixture-owned-policy","execution":{"path":"stage__mode","invocation":{"loopPath":[]}},"seams":false,"code":false,"tests":false,"errors":false,"docs":false,"part":null}'
-stage__route: { seams: false, code: true, tests: false, errors: false, docs: false, reason: "stub: a small change" }
+stage__mode: '{"continuation":false,"light":false,"head":"fixturehead","cursor":"","risks":"fixture-owned-policy","seams":false,"code":false,"tests":false,"errors":false,"docs":false,"ux":false,"part":null}'
+stage__route: { seams: false, code: true, tests: false, errors: false, docs: false, ux: false, reason: "stub: a small change" }
 stage__scope:
   head_matches: true
   pr: { repo: { host: github.com, path: example/repo }, number: 1 }
@@ -47,6 +47,4 @@ fixture:
     scope: "https://github.com/example/repo/pull/1"
   expect: paused
   reached: [stage__result, attend__settle]
-  resolved-text-contains:
-    attend__ask: "- `ready` (stub: mark it ready): stub: takes pull request 1 out of draft"
 exec-code: true

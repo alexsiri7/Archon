@@ -25,6 +25,7 @@ import {
   type ProviderEventRecord,
 } from '@archon/workflows/schemas/provider-event';
 import { toHydratedTimestamp } from './timestamps';
+import { runEventsSql } from './run-events-sql';
 import {
   PROVIDER_EVENT_ROW_TYPES,
   NODE_LIFECYCLE_EVENT_TYPES,
@@ -192,7 +193,8 @@ export async function persistWorkflowEventIfRunning(
 
 /**
  * List all events for a workflow run in lifecycle order. `event_order` is
- * allocated by the database, so it preserves insertion order when timestamps tie.
+ * allocated by the database and takes precedence over timestamps. Legacy rows
+ * without a sequence come first, ordered by timestamp then id.
  */
 export async function listWorkflowEvents(
   workflowRunId: string,
@@ -207,7 +209,7 @@ export async function listWorkflowEvents(
     const result = await pool.query<WorkflowEventRow>(
       `SELECT * FROM remote_agent_workflow_events
        WHERE workflow_run_id = $1${excludeClause}
-       ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
+       ORDER BY COALESCE(event_order, 0) ASC, created_at ASC, id ASC`,
       [workflowRunId, ...excluded]
     );
     return [...result.rows].map(row => ({
@@ -249,7 +251,7 @@ export async function listProviderEvents(
     const result = await pool.query<WorkflowEventRow>(
       `SELECT * FROM remote_agent_workflow_events
        WHERE workflow_run_id = $1 AND event_type IN (${typePlaceholders})${stepClause}
-       ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
+       ORDER BY COALESCE(event_order, 0) ASC, created_at ASC, id ASC`,
       params
     );
     rows = result.rows.map(parseEventRow);
@@ -280,16 +282,12 @@ export async function listActiveWorkflowNodeIds(
   if (workflowRunIds.length === 0) return new Map();
 
   const activeByRun = new Map(workflowRunIds.map(id => [id, new Set<string>()]));
-  const runPlaceholders = workflowRunIds.map((_, index) => `$${String(index + 1)}`);
-  const eventPlaceholders = NODE_LIFECYCLE_EVENT_TYPES.map(
-    (_, index) => `$${String(workflowRunIds.length + index + 1)}`
-  );
   const result = await pool.query<NodeLifecycleEventRow>(
-    `SELECT workflow_run_id, step_name, event_type
-     FROM remote_agent_workflow_events
-     WHERE workflow_run_id IN (${runPlaceholders.join(', ')})
-       AND event_type IN (${eventPlaceholders.join(', ')})
-     ORDER BY workflow_run_id, created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
+    runEventsSql(
+      'workflow_run_id, step_name, event_type',
+      workflowRunIds.length,
+      NODE_LIFECYCLE_EVENT_TYPES.length
+    ),
     [...workflowRunIds, ...NODE_LIFECYCLE_EVENT_TYPES]
   );
 
@@ -303,7 +301,8 @@ export async function listActiveWorkflowNodeIds(
 
 /**
  * Rows of the given event types, data included, for several runs in one query: each
- * run's rows in event order, and an entry (possibly empty) for every requested run. A
+ * run's rows in durable event order, and an entry (possibly empty) for every requested run.
+ * Legacy rows without a sequence precede sequenced rows, ordered by timestamp then id. A
  * run list uses it to report per-node state without one query per run, fetching only the
  * types its fold reads so high-volume rows such as provider events never leave the
  * database.
@@ -315,16 +314,9 @@ export async function listEventsForRuns(
   const byRun = new Map<string, WorkflowEventRow[]>(workflowRunIds.map(id => [id, []]));
   if (workflowRunIds.length === 0 || eventTypes.length === 0) return byRun;
 
-  const runPlaceholders = workflowRunIds.map((_, index) => `$${String(index + 1)}`);
-  const eventPlaceholders = eventTypes.map(
-    (_, index) => `$${String(workflowRunIds.length + index + 1)}`
-  );
   try {
     const result = await pool.query<WorkflowEventRow>(
-      `SELECT * FROM remote_agent_workflow_events
-       WHERE workflow_run_id IN (${runPlaceholders.join(', ')})
-         AND event_type IN (${eventPlaceholders.join(', ')})
-       ORDER BY workflow_run_id, created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
+      runEventsSql('*', workflowRunIds.length, eventTypes.length),
       [...workflowRunIds, ...eventTypes]
     );
     for (const row of result.rows) byRun.get(row.workflow_run_id)?.push(parseEventRow(row));
@@ -345,7 +337,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
      WHERE workflow_run_id = $1 AND event_type IN (${DURABLE_WORKFLOW_EVENT_TYPES.map(
        (_, index) => `$${String(index + 2)}`
      ).join(', ')}, $${String(DURABLE_WORKFLOW_EVENT_TYPES.length + 2)})
-     ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
+     ORDER BY COALESCE(event_order, 0) ASC, created_at ASC, id ASC`,
     [workflowRunId, ...DURABLE_WORKFLOW_EVENT_TYPES, 'fan_out_instances']
   );
   return foldDagResumeSnapshot(result.rows, workflowRunId);
@@ -364,7 +356,7 @@ export async function listAttentionNotices(
   const result = await query<WorkflowEventRow>(
     `SELECT * FROM remote_agent_workflow_events
     WHERE event_type = 'attention_notice_sent' AND workflow_run_id IN (${runIds.map((_, i) => `$${String(i + 1)}`).join(', ')})
-    ORDER BY created_at, event_order, id`,
+    ORDER BY COALESCE(event_order, 0) ASC, created_at ASC, id ASC`,
     [...runIds]
   );
   return result.rows.map(row => ({

@@ -4,9 +4,14 @@
  *
  * `toAttentionQueueItem` is the one constructor: it builds an item from a run row and its
  * run-attention projection, so the list, the single read and the stream
- * (`attention-watch.ts`) cannot disagree. Labels are data. The queue filters them by exact match and sorts them as
+ * (`attention-watch.ts`) share the readable projection. Labels are data. The queue filters them by exact match and sorts them as
  * plain strings, and nothing here depends on who is asking.
  */
+import {
+  isAttentionDegraded,
+  splitAttentionRead,
+  type AttentionRead,
+} from './schemas/attention-degraded';
 import { z } from 'zod';
 import {
   getRunArtifactsDirForRoot,
@@ -20,8 +25,9 @@ import {
   attentionLabelKeySchema,
   attentionLabelsSchema,
   attentionOptionSchema,
+  attentionRecommendationSchema,
   type AttentionLabels,
-} from './schemas/dag-node';
+} from './schemas/wait-node';
 import {
   attentionLabels,
   attentionRevision,
@@ -41,7 +47,7 @@ import type { IWorkflowStore } from './store';
  * A project as the engine identifies it. `key` is the identity: the project storage key
  * state documents scope by, so `archon state --project <key>` reaches the same project.
  * `codebaseId` is null when the project has no codebase row, such as a run in an
- * unregistered directory (`_cwd/<name>`). `name` is the codebase's name, or otherwise
+ * unregistered directory (`@cwd/<basename>-<digest>`). `name` is the codebase's name, or otherwise
  * the key's last segment.
  */
 export const projectRefSchema = z.object({
@@ -67,11 +73,19 @@ export const attentionQueueContextSchema = z.object({
   branch: z.string().nullable(),
 });
 
+/** What an item's run is part of; attention stream lines carry the same two fields. */
+export const attentionItemRunContextFields = {
+  workflow: z.string(),
+  /** The run's direct parent run, for every child run; null for a top-level run. */
+  parentRunId: z.string().nullable(),
+};
+
 const itemBase = {
   runId: z.string(),
-  workflow: z.string(),
+  workflow: attentionItemRunContextFields.workflow,
   /** Null only when the run has no trusted storage root, so there is no key to give. */
   project: projectRefSchema.nullable(),
+  parentRunId: attentionItemRunContextFields.parentRunId,
   /** Set when the run is a `fan_out:` child; null for every other run. */
   fanOut: fanOutPositionSchema.nullable(),
   /** 1, plus one for every label write since the pause opened. */
@@ -100,6 +114,7 @@ export const attentionQueueItemSchema = z.discriminatedUnion('kind', [
     message: z.string(),
     form: attentionFormSchema,
     options: z.array(attentionOptionSchema),
+    recommendation: attentionRecommendationSchema.optional(),
   }),
   z.object({
     kind: z.literal('awaiting_response'),
@@ -191,6 +206,7 @@ export function toAttentionQueueItem(
     runId: run.id,
     workflow: run.workflow_name,
     project: projectRefForRun(run, sources.codebase),
+    parentRunId: run.parent_run_id,
     fanOut: fanOutPosition(run),
     revision: wait === undefined ? 1 : attentionRevision(wait),
     labels: wait === undefined ? {} : attentionLabels(wait),
@@ -212,6 +228,9 @@ export function toAttentionQueueItem(
         message: attention.message,
         form: attention.form,
         options: attention.options,
+        ...(attention.recommendation !== undefined
+          ? { recommendation: attention.recommendation }
+          : {}),
       };
     case 'awaiting_response':
       return {
@@ -230,7 +249,10 @@ export function toAttentionQueueItem(
 
 /** What the queue reads: the store, and the host's record of each checkout's branch. */
 export interface AttentionQueueSource {
-  store: Pick<IWorkflowStore, 'listAttentionQueueRows' | 'getWorkflowRun' | 'getCodebase'>;
+  store: Pick<
+    IWorkflowStore,
+    'listAttentionQueueRows' | 'getWorkflowRun' | 'getWorkflowRunForAttention' | 'getCodebase'
+  >;
   /** The branch of a run's checkout; null when the host has no record of one. */
   branchOf(run: WorkflowRun): Promise<string | null>;
 }
@@ -304,13 +326,42 @@ export async function attentionQueueItemForRun(
 /** The items for rows the store's queue list returned, in their order. */
 export async function attentionQueueItems(
   source: AttentionQueueSource,
-  runs: readonly WorkflowRun[]
-): Promise<AttentionQueueItem[]> {
+  runs: readonly AttentionRead<WorkflowRun>[]
+): Promise<AttentionRead<AttentionQueueItem>[]> {
+  const unreadableIds = new Set(splitAttentionRead(runs).degraded.map(report => report.runId));
+  const reportedUnreadableRun = new Error('Run already reported unreadable by attention batch');
+  const unreadableDescendant = new Error('Unreadable attention descendant');
+  const batchSource: AttentionQueueSource = {
+    ...source,
+    store: {
+      listAttentionQueueRows: () => source.store.listAttentionQueueRows(),
+      getWorkflowRunForAttention: id => source.store.getWorkflowRunForAttention(id),
+      getCodebase: id => source.store.getCodebase(id),
+      getWorkflowRun: async id => {
+        // The batch already reports this row. Rereading it could log stored parser text;
+        // treating it as missing would instead invent a missing-child queue item.
+        if (unreadableIds.has(id)) throw reportedUnreadableRun;
+        const child = await source.store.getWorkflowRunForAttention(id);
+        if (child !== null && isAttentionDegraded(child)) throw unreadableDescendant;
+        return child;
+      },
+    },
+  };
   const codebases: CodebaseCache = new Map();
-  const items: AttentionQueueItem[] = [];
+  const items: AttentionRead<AttentionQueueItem>[] = [];
   for (const run of runs) {
-    const item = await attentionQueueItemForRun(source, run, codebases);
-    if (item !== null) items.push(item);
+    if (isAttentionDegraded(run)) {
+      items.push(run);
+      continue;
+    }
+    try {
+      const item = await attentionQueueItemForRun(batchSource, run, codebases);
+      if (item !== null) items.push(item);
+    } catch (error) {
+      if (error === reportedUnreadableRun) continue;
+      if (error !== unreadableDescendant) throw error;
+      items.push({ type: 'degraded', reason: 'run_unreadable', runId: run.id });
+    }
   }
   return items;
 }
@@ -318,7 +369,7 @@ export async function attentionQueueItems(
 /** Every item in the install, in the store's order: most recently started run first. */
 export async function listAttentionQueue(
   source: AttentionQueueSource
-): Promise<AttentionQueueItem[]> {
+): Promise<AttentionRead<AttentionQueueItem>[]> {
   return attentionQueueItems(source, await source.store.listAttentionQueueRows());
 }
 
@@ -368,7 +419,9 @@ export function isInAttentionScope(
 export type AttentionQueueOrder = { by: 'age' } | { by: 'label'; key: string };
 
 /** What a count groups by: project, or one label's value. */
-export type AttentionQueueCountBy = { by: 'project' } | { by: 'label'; key: string };
+export type AttentionQueueCountBy = {
+  [Counts in AttentionQueueCounts as Counts['by']]: Omit<Counts, 'counts'>;
+}[AttentionQueueCounts['by']];
 
 export interface AttentionQueueQuery {
   scope: AttentionQueueScope;
@@ -524,34 +577,50 @@ export function countAttentionQueue(
 ): AttentionQueueCounts {
   const selected = items.filter(item => inQuery(item, query));
   const { countBy } = query;
-  if (countBy.by === 'project') {
-    const groups = new Map<string, { project: ProjectRef | null; count: number }>();
-    for (const item of selected) {
-      const id =
-        item.project === null
-          ? 'none'
-          : item.project.codebaseId !== null
-            ? `codebase:${item.project.codebaseId}`
-            : `key:${item.project.key}`;
-      const group = groups.get(id) ?? { project: item.project, count: 0 };
-      group.count += 1;
-      groups.set(id, group);
-    }
-    return {
-      by: 'project',
-      counts: [...groups.values()].sort(
-        (a, b) => b.count - a.count || compareStrings(a.project?.key ?? '', b.project?.key ?? '')
-      ),
-    };
+  switch (countBy.by) {
+    case 'project':
+      return countQueueByProject(selected);
+    case 'label':
+      return countQueueByLabel(selected, countBy.key);
   }
+  return countBy satisfies never;
+}
+
+function countQueueByProject(
+  items: readonly AttentionQueueItem[]
+): Extract<AttentionQueueCounts, { by: 'project' }> {
+  const groups = new Map<string, { project: ProjectRef | null; count: number }>();
+  for (const item of items) {
+    const id =
+      item.project === null
+        ? 'none'
+        : item.project.codebaseId !== null
+          ? `codebase:${item.project.codebaseId}`
+          : `key:${item.project.key}`;
+    const group = groups.get(id) ?? { project: item.project, count: 0 };
+    group.count += 1;
+    groups.set(id, group);
+  }
+  return {
+    by: 'project',
+    counts: [...groups.values()].sort(
+      (a, b) => b.count - a.count || compareStrings(a.project?.key ?? '', b.project?.key ?? '')
+    ),
+  };
+}
+
+function countQueueByLabel(
+  items: readonly AttentionQueueItem[],
+  key: string
+): Extract<AttentionQueueCounts, { by: 'label' }> {
   const groups = new Map<string | null, number>();
-  for (const item of selected) {
-    const value = Object.hasOwn(item.labels, countBy.key) ? (item.labels[countBy.key] ?? '') : null;
+  for (const item of items) {
+    const value = Object.hasOwn(item.labels, key) ? (item.labels[key] ?? '') : null;
     groups.set(value, (groups.get(value) ?? 0) + 1);
   }
   return {
     by: 'label',
-    key: countBy.key,
+    key,
     counts: [...groups.entries()]
       .map(([value, count]) => ({ value, count }))
       .sort((a, b) => b.count - a.count || compareStrings(a.value ?? '', b.value ?? '')),

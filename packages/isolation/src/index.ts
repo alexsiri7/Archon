@@ -42,13 +42,18 @@ export type {
 } from './types';
 
 export {
+  ISOLATION_PROVIDER_TYPES,
+  ISOLATION_WORKFLOW_TYPES,
+  ENVIRONMENT_STATUSES,
   isPRIsolationRequest,
   CONTAINER_LABELS,
   worktreeRegistrationMetadata,
   WORKTREE_REGISTRATION_ID,
+  WORKTREE_REMOVAL_OWNER,
   readWorktreeCreationId,
   readWorktreeBranchCreated,
   WorktreeRegistrationChangedError,
+  WorktreeRemovalInProgressError,
 } from './types';
 
 // --- Backend seam (folder projects) ---
@@ -86,6 +91,7 @@ export type { IsolationResolverDeps } from './resolver';
 
 // --- Provider ---
 export { WorktreeProvider, resolveRepoLocalOverride } from './providers/worktree';
+export { isGeneratedTaskBranch } from './providers/worktree/branches';
 
 // --- PR state lookup ---
 export { getPrState } from './pr-state';
@@ -105,3 +111,9 @@ export type { WorktreeSetupExecutor, WorktreeSetupInput } from './types';
 export { WorktreePostCreateError } from './errors';
 
 export type { IsolationFailureKind } from './errors';
+
+export {
+  releaseRunVerificationImages,
+  VerificationImageInventoryError,
+  VERIFICATION_IMAGE_RUN_LABEL,
+} from './container/verification-images';

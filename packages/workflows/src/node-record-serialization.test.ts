@@ -1,6 +1,13 @@
+// @archon-test-isolated
 import { finishNodeExecution, startNodeExecution, newNodeInvocation } from './node-execution';
-import { readNodeRecordEvent, readDeferredNodeUsageEvent } from './node-record-reader';
+import {
+  isExecNodeRecord,
+  readNodeRecordEvent,
+  readDeferredNodeUsageEvent,
+} from './node-record-reader';
+import { declaredOutputPathsFromSchema, resolveNodeOutputField } from './output-ref';
 import { describe, expect, it } from 'bun:test';
+import { execNodeSchema } from './schemas/exec-node';
 import {
   nodeCostScope,
   serializeNodeEmitter,
@@ -64,6 +71,61 @@ const record = (): NodeExecutionRecord => ({
 });
 
 describe('node record serializers', () => {
+  it('persists and reads every schema-owned metadata field', () => {
+    const source = record();
+    const durable = serializeNodeStateRecord(source);
+    const restored = readNodeRecordEvent({ ...durable, data: JSON.stringify(durable.data) });
+    for (const key of nodeExecutionMetadataSchema.keyof().options) {
+      expect(Object.hasOwn(source, key)).toBe(true);
+      expect(restored?.metadata?.[key]).toEqual(source[key]);
+      if (key === 'runId' || key === 'path' || key === 'lifecycle') {
+        expect(durable.data).not.toHaveProperty(key);
+      } else {
+        expect(Object.hasOwn(durable.data, key)).toBe(true);
+        expect(durable.data[key]).toEqual(source[key]);
+        expect(restored?.data[key]).toEqual(source[key]);
+      }
+    }
+  });
+
+  it('classifies current and metadata-free exec records using the persisted writer vocabulary', () => {
+    for (const runtime of execNodeSchema.shape.runtime.options) {
+      const source: NodeExecutionRecord = {
+        ...record(),
+        node: { id: 'exec', kind: 'exec', runtime },
+      };
+      const event = serializeNodeStateRecord(source);
+      expect(event.data.type).toBe(runtime === 'sh' ? 'bash' : 'script');
+      for (const data of [event.data, { type: event.data.type }]) {
+        const restored = readNodeRecordEvent({ ...event, data });
+        expect(restored).toBeDefined();
+        expect(restored && isExecNodeRecord(restored)).toBe(true);
+      }
+    }
+    const event = serializeNodeStateRecord(record());
+    for (const data of [event.data, { type: event.data.type }, {}]) {
+      const restored = readNodeRecordEvent({ ...event, data });
+      expect(restored && isExecNodeRecord(restored)).toBe(false);
+    }
+  });
+
+  it.each([
+    ['started', 'node_start'],
+    ['completed', 'node_complete'],
+  ] as const)('labels %s shell transcript rows as <bash>', (status, type) => {
+    const source: NodeExecutionRecord = {
+      ...record(),
+      node: { id: 'build', kind: 'exec', runtime: 'sh' },
+      lifecycle: { status },
+    };
+
+    expect(serializeNodeTranscript(source)).toMatchObject({
+      type,
+      step: 'build',
+      content: '<bash>',
+    });
+  });
+
   it('projects deferred usage without lifecycle, output or provider binding', () => {
     const source = {
       ...record(),
@@ -82,9 +144,16 @@ describe('node record serializers', () => {
       },
     });
     expect(Object.keys(event.data).sort()).toEqual(
-      ['accounting', 'spend', 'tokens', 'cost_usd'].sort()
+      ['accounting', 'invocation', 'spend', 'tokens', 'cost_usd'].sort()
     );
     expect(readNodeRecordEvent(event)).toBeUndefined();
+    const withBaseline = serializeDeferredNodeUsage(source, source.spend);
+    expect(
+      readDeferredNodeUsageEvent({
+        ...withBaseline,
+        data: JSON.stringify(withBaseline.data),
+      })?.data.loopBaseline
+    ).toEqual(source.spend);
   });
 
   it('distinguishes incomplete token accounting from an ordinary unavailable measurement', () => {
@@ -152,6 +221,20 @@ describe('node record serializers', () => {
     expect(restored?.metadata?.spend.costUsd).toEqual({ source: 'unavailable', reason: 'invalid' });
     expect(restored?.metadata?.spend.tokens).toEqual({ source: 'unavailable', reason: 'invalid' });
     expect(restored?.data).not.toHaveProperty('cost_usd');
+  });
+
+  it('projects the requested binding onto the started event', () => {
+    const source = record();
+    source.lifecycle = { status: 'started' };
+    source.binding.effort = 'high';
+
+    expect(serializeNodeEmitter(source)).toMatchObject({
+      type: 'node_started',
+      provider: 'claude',
+      model: 'large',
+      tier: 'large',
+      effort: 'high',
+    });
   });
 
   it('projects one canonical record truthfully through persistence, transcript, emitter and runtime', () => {
@@ -341,6 +424,39 @@ describe('node record serializers', () => {
     expect(serializeNodeOutput(source)).not.toHaveProperty('costUsd');
   });
 
+  it.each([
+    { status: 'completed' },
+    { status: 'failed', error: 'body failed' },
+    {
+      status: 'skipped',
+      reason: 'trigger_rule',
+      cause: { kind: 'upstream_failed', origin: 'peer' },
+    },
+    { status: 'suspended', point: 'interactive_loop' },
+  ] as const)('preserves unpriced group usage through $status finalization', lifecycle => {
+    const started = startNodeExecution({
+      runId: 'run',
+      path: 'group',
+      invocation: newNodeInvocation(),
+      node: {
+        id: 'group',
+        kind: 'loop_group',
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 1,
+          fresh_context: false,
+          nodes: [{ id: 'child', kind: 'agent', source: { kind: 'inline', prompt: 'Work' } }],
+        },
+      },
+    });
+    expect(started.spend.costUsd).toEqual({ source: 'unavailable', reason: 'not_applicable' });
+    const finished = finishNodeExecution(started, lifecycle, { costPartial: true });
+    const saved = readNodeRecordEvent(serializeNodeStateRecord(finished));
+    expect(saved?.metadata?.spend.costUsd).toEqual({ source: 'unavailable', reason: 'incomplete' });
+    expect(serializeNodeOutput(finished)).toMatchObject({ costPartial: true });
+    expect(serializeNodeOutput(finished)).not.toHaveProperty('costUsd');
+  });
+
   it('marks a partially reported cost as a floor without changing its value', () => {
     const started = startNodeExecution({
       runId: 'run',
@@ -391,4 +507,58 @@ it('persists the path contract beside its legacy root fields and reads either sh
         ?.data.declared_output_paths
     ).toEqual([['a'], ['b']]);
   }
+});
+
+it('round trips a composed path contract without changing its persisted shape', () => {
+  const paths = declaredOutputPathsFromSchema({
+    anyOf: [
+      { properties: { proposal: { properties: { action: { type: 'string' } } } } },
+      { properties: { proposal: { properties: { reason: { type: 'string' } } } } },
+    ],
+  });
+  const source = record();
+  source.output = { text: '{"proposal":{"reason":"needed"}}', declaredOutputPaths: paths };
+  const event = serializeNodeStateRecord(source);
+  expect(event.data).toMatchObject({
+    declared_fields: ['proposal'],
+    declared_output_paths: [['proposal'], ['proposal', 'action'], ['proposal', 'reason']],
+  });
+  const restored = readNodeRecordEvent({ ...event, data: JSON.stringify(event.data) });
+  expect(restored?.data.declared_output_paths).toEqual(paths);
+  expect(
+    resolveNodeOutputField(
+      {
+        state: 'completed',
+        output: source.output.text,
+        declaredOutputPaths: restored?.data.declared_output_paths,
+      },
+      'review',
+      'proposal.reason',
+      '$review.output.proposal.reason'
+    )
+  ).toEqual({ kind: 'value', value: 'needed' });
+});
+
+it('preserves an empty strict composed contract through persistence and authorization', () => {
+  const paths = declaredOutputPathsFromSchema({ allOf: [{}] });
+  expect(paths).toEqual([]);
+  const source = record();
+  const text = '{"undeclared":"present"}';
+  source.output = { text, declaredOutputPaths: paths };
+  const event = serializeNodeStateRecord(source);
+  expect(event.data).toMatchObject({ declared_fields: [], declared_output_paths: [] });
+  const restored = readNodeRecordEvent({ ...event, data: JSON.stringify(event.data) });
+  expect(restored?.data.declared_output_paths).toEqual([]);
+  expect(() =>
+    resolveNodeOutputField(
+      {
+        state: 'completed',
+        output: text,
+        declaredOutputPaths: restored?.data.declared_output_paths,
+      },
+      'review',
+      'undeclared',
+      '$review.output.undeclared'
+    )
+  ).toThrow('not declared');
 });

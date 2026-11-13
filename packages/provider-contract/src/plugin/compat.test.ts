@@ -2,14 +2,14 @@ import { expect, test } from 'bun:test';
 import { z } from 'zod';
 import type { ProviderChunk } from '../events';
 import { connectProvider } from './connect';
-import baseline from './fixtures/protocol-2-baseline.schema.json';
+import baseline from './fixtures/protocol-3-baseline.schema.json';
 import { descriptor, fixtureProvider } from './fixtures/provider';
 import { streamPair } from './fixtures/streams';
-import { PluginProtocolMismatchError, PluginRemoteError, PluginRpc } from './rpc';
+import { PluginProtocolMismatchError, PluginRpc } from './rpc';
 import { serveProvider } from './serve';
 import { PROVIDER_PLUGIN_PROTOCOL, type ProviderSessionRequest } from './wire';
 
-// The published schema at the first protocol-2 release. Every protocol-2 peer must keep
+// The published schema at the first protocol-3 release. Every protocol-3 peer must keep
 // speaking with the current code; a protocol bump replaces this snapshot.
 function baselineDef(name: keyof typeof baseline.$defs): z.ZodType {
   // JSON imports widen literal schema keywords such as type to string.
@@ -37,6 +37,7 @@ const sessionRequest = {
   appendSystemPrompt: 'append',
   outputFormat: { type: 'json_schema', schema: { type: 'object' } },
   protectedEnvKeys: ['SECRET'],
+  userCredentialEnvKeys: ['USER_SECRET'],
   maxBudgetUsd: 1,
   fallbackModel: 'fallback-model',
   forkSession: true,
@@ -61,50 +62,69 @@ const sessionRequest = {
   env: { KEY: 'value' },
 } satisfies ProviderSessionRequest;
 
-test('a protocol-1 host gets the current descriptor and cannot start a session', async () => {
-  const pair = streamPair();
-  const serving = serveProvider({ descriptor, create: () => fixtureProvider() }, pair.provider);
-  const host = new PluginRpc(pair.host);
-  try {
-    expect(await host.request('initialize', initializeParams(1))).toMatchObject({
-      agentCapabilities: { _meta: { archon: { protocol: PROVIDER_PLUGIN_PROTOCOL } } },
-    });
-    await expect(
-      host.request('session/new', {
-        cwd: '/',
-        mcpServers: [],
-        _meta: { archon: { request: { prompt: 'turn', cwd: '/' } } },
-      })
-    ).rejects.toThrow('initialize must complete');
-  } finally {
-    await host.close();
-    await serving;
-  }
-});
-
-test('connect names both versions when the plugin speaks another protocol', async () => {
-  for (const protocol of [PROVIDER_PLUGIN_PROTOCOL - 1, PROVIDER_PLUGIN_PROTOCOL + 1]) {
+test.each([
+  [1, 'full'],
+  [1, 'minimal'],
+  [2, 'full'],
+  [2, 'minimal'],
+] as const)(
+  'a protocol-%s host with a %s envelope gets the current descriptor and cannot start a session',
+  async (protocol, envelope) => {
     const pair = streamPair();
-    const agent = new PluginRpc(pair.provider);
-    agent.handle('initialize', () => ({
-      protocolVersion: 1,
-      agentCapabilities: { _meta: { archon: { ...descriptor, protocol } } },
-      authMethods: [],
-    }));
-    const error: unknown = await connectProvider(pair.host).catch((error: unknown) => error);
-    expect(error).toBeInstanceOf(PluginProtocolMismatchError);
-    expect(error).toMatchObject({
-      plugin: 'test-provider',
-      hostProtocol: PROVIDER_PLUGIN_PROTOCOL,
-      pluginProtocol: protocol,
-      message: expect.stringContaining(
-        `plugin speaks protocol ${String(protocol)}; this Archon speaks protocol ${String(PROVIDER_PLUGIN_PROTOCOL)}`
-      ),
-    });
-    await agent.done;
-    await agent.close();
+    const serving = serveProvider({ descriptor, create: () => fixtureProvider() }, pair.provider);
+    const host = new PluginRpc(pair.host);
+    try {
+      const params =
+        envelope === 'full'
+          ? initializeParams(protocol)
+          : { clientCapabilities: { _meta: { archon: { protocol } } } };
+      expect(await host.request('initialize', params)).toMatchObject({
+        agentCapabilities: { _meta: { archon: { protocol: PROVIDER_PLUGIN_PROTOCOL } } },
+      });
+      await expect(
+        host.request('session/new', {
+          cwd: '/',
+          mcpServers: [],
+          _meta: { archon: { request: { prompt: 'turn', cwd: '/' } } },
+        })
+      ).rejects.toThrow('initialize must complete');
+    } finally {
+      await host.close();
+      await serving;
+    }
   }
-});
+);
+
+test.each(['full', 'minimal'] as const)(
+  'connect names both versions when the plugin speaks another protocol with a %s envelope',
+  async envelope => {
+    for (const protocol of [PROVIDER_PLUGIN_PROTOCOL - 1, PROVIDER_PLUGIN_PROTOCOL + 1]) {
+      const pair = streamPair();
+      const agent = new PluginRpc(pair.provider);
+      agent.handle('initialize', () =>
+        envelope === 'full'
+          ? {
+              protocolVersion: 1,
+              agentCapabilities: { _meta: { archon: { ...descriptor, protocol } } },
+              authMethods: [],
+            }
+          : { agentCapabilities: { _meta: { archon: { id: descriptor.id, protocol } } } }
+      );
+      const error: unknown = await connectProvider(pair.host).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(PluginProtocolMismatchError);
+      expect(error).toMatchObject({
+        plugin: 'test-provider',
+        hostProtocol: PROVIDER_PLUGIN_PROTOCOL,
+        pluginProtocol: protocol,
+        message: expect.stringContaining(
+          `plugin speaks protocol ${String(protocol)}; this Archon speaks protocol ${String(PROVIDER_PLUGIN_PROTOCOL)}`
+        ),
+      });
+      await agent.done;
+      await agent.close();
+    }
+  }
+);
 
 test('the baseline is the current protocol', () => {
   expect(baseline.$defs.ProviderPluginDescriptor.properties.protocol.const).toBe(
@@ -216,7 +236,11 @@ function pinnedPlugin(io: ReturnType<typeof streamPair>['provider']): {
   handle('session/new', 'ProviderNewSessionRequest', { sessionId: 'session' });
   agent.handle('session/prompt', async params => {
     baselineDef('ProviderPromptRequest').parse(params);
-    await agent.notify('_archon/chunk', { sessionId: 'session', chunk: { type: 'settled' } });
+    for (const type of ['heartbeat', 'settled'] as const) {
+      const notification = { sessionId: 'session', chunk: { type } };
+      baselineDef('ProviderChunkNotification').parse(notification);
+      await agent.notify('_archon/chunk', notification);
+    }
     return { stopReason: 'end_turn' };
   });
   handle('_archon/check_credential', 'ProviderCheckCredentialRequest', {
@@ -241,7 +265,7 @@ test('current requests reach a plugin pinned to the baseline', async () => {
       nativeTools: nativeTools.map(tool => ({ ...tool, handler: async (): Promise<string> => '' })),
     }))
       chunks.push(chunk);
-    expect(chunks).toEqual([{ type: 'settled' }]);
+    expect(chunks).toEqual([{ type: 'heartbeat' }, { type: 'settled' }]);
     expect(requests[1]).toMatchObject({ _meta: { archon: { request: sessionRequest } } });
     const signal = new AbortController().signal;
     expect(await client.checkCredential({ model: 'test-model', env: {}, signal })).toEqual({
@@ -257,19 +281,21 @@ test('current requests reach a plugin pinned to the baseline', async () => {
   }
 });
 
-test('a field newer than the pinned plugin fails instead of being dropped', async () => {
+test('unknown request fields fail instead of being dropped by a pinned plugin', async () => {
   const pair = streamPair();
   const { agent } = pinnedPlugin(pair.provider);
-  const client = await connectProvider(pair.host);
+  const host = new PluginRpc(pair.host);
   try {
-    const error: unknown = await client
-      .sendQuery('turn', '/workspace', undefined, { userCredentialEnvKeys: ['KEY'] })
-      .next()
-      .catch((error: unknown) => error);
-    expect(error).toBeInstanceOf(PluginRemoteError);
-    expect(error).toMatchObject({ code: -32602 });
+    await host.request('initialize', initializeParams(PROVIDER_PLUGIN_PROTOCOL));
+    await expect(
+      host.request('session/new', {
+        cwd: '/workspace',
+        mcpServers: [],
+        _meta: { archon: { request: { prompt: 'turn', cwd: '/workspace', futureOption: true } } },
+      })
+    ).rejects.toMatchObject({ code: -32602 });
   } finally {
-    await client.close();
+    await host.close();
     await agent.close();
   }
 });

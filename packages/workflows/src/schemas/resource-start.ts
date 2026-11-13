@@ -74,11 +74,56 @@ export const preparedWorkflowLaunchSchema = z.union([
 ]);
 export type PreparedWorkflowLaunch = z.infer<typeof preparedWorkflowLaunchV2Schema>;
 
+export const ADMISSION_CHECKOUT_GUARD_METADATA_KEY = 'admission_checkout_guard';
+
+export class AdmissionCheckoutGuardError extends Error {
+  constructor(readonly requestId: string) {
+    super(
+      `Invalid ${ADMISSION_CHECKOUT_GUARD_METADATA_KEY} for request '${requestId}': expected a boolean`
+    );
+    this.name = 'AdmissionCheckoutGuardError';
+  }
+}
+
+/** Older writers did not record the declaration, so their launches remain guarded. */
+export function readAdmissionCheckoutGuard(launch: PreparedWorkflowLaunch): boolean {
+  const value = launch.run.metadata[ADMISSION_CHECKOUT_GUARD_METADATA_KEY];
+  if (value === undefined) return true;
+  if (typeof value !== 'boolean') throw new AdmissionCheckoutGuardError(launch.run.id);
+  return value;
+}
+
 /** Run metadata key naming the receipt binding that requested a resource start. */
 export const RESOURCE_START_METADATA_KEY = 'resource_start';
 export interface ResourceStartRunMetadata {
   receiptId: string;
   bindingId: string;
+}
+
+/** The receipt that requested this run's start, from its `resource_start` metadata. */
+export function readResourceStartReceiptId(
+  metadata: Readonly<Record<string, unknown>> | undefined
+): string | undefined {
+  const origin = metadata?.[RESOURCE_START_METADATA_KEY];
+  if (typeof origin !== 'object' || origin === null || Array.isArray(origin)) return undefined;
+  const receiptId = (origin as Record<string, unknown>).receiptId;
+  return typeof receiptId === 'string' ? receiptId : undefined;
+}
+
+/**
+ * `sourceActor.source` of a receipt that `archon trigger fire` accepted from inside a
+ * run: `id` is that run and `display` the node path. Provenance only; the started run
+ * still acts as its binding's run-as user.
+ */
+export const RUN_SOURCE_ACTOR = 'archon-run';
+
+/** The run and node that requested a start, or null when the source was not a run. */
+export function requestingRun(
+  actor: SourceReceiptInput['sourceActor']
+): { runId: string; nodePath: string | null } | null {
+  return actor?.source === RUN_SOURCE_ACTOR
+    ? { runId: actor.id, nodePath: actor.display ?? null }
+    : null;
 }
 
 /**

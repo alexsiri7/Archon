@@ -126,6 +126,10 @@
         },
         "resumed": {
           "type": "boolean"
+        },
+        "sessionNotFound": {
+          "type": "boolean",
+          "const": true
         }
       }
     },
@@ -296,6 +300,10 @@
             "text": {
               "type": "string",
               "minLength": 1
+            },
+            "continuesPreviousBlock": {
+              "type": "boolean",
+              "const": true
             }
           },
           "required": [
@@ -596,6 +604,18 @@
             "type",
             "state"
           ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "heartbeat"
+            }
+          },
+          "required": [
+            "type"
+          ]
         }
       ]
     },
@@ -650,6 +670,10 @@
             },
             "resumed": {
               "type": "boolean"
+            },
+            "sessionNotFound": {
+              "type": "boolean",
+              "const": true
             },
             "type": {
               "type": "string",
@@ -967,7 +991,7 @@
       "properties": {
         "protocol": {
           "type": "number",
-          "const": 2
+          "const": 3
         },
         "id": {
           "type": "string",
@@ -1401,7 +1425,7 @@
                   "properties": {
                     "protocol": {
                       "type": "number",
-                      "const": 2
+                      "const": 3
                     }
                   },
                   "required": [
@@ -1665,6 +1689,55 @@
     "ProviderCheckCredentialRequest": {
       "type": "object",
       "properties": {
+        "execContext": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "const": "host"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "const": "container"
+                },
+                "containerId": {
+                  "type": "string"
+                },
+                "execUser": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "containerId"
+              ]
+            }
+          ]
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "settingSources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "project",
+              "user"
+            ]
+          }
+        },
         "model": {
           "type": "string"
         },
@@ -1675,6 +1748,15 @@
           },
           "additionalProperties": {
             "$ref": "#/$defs/schema9"
+          }
+        },
+        "env": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
           }
         }
       }

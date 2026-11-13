@@ -227,6 +227,23 @@ test('a head selector accepts only an open pull request', async () => {
   });
 });
 
+test('a head selector for any state accepts a closed pull request from a plugin that declares it', async () => {
+  const anyState = {
+    operationId: 'head-any',
+    op: 'pr.view',
+    selector: { kind: 'head', repo: ref.repo, headRepo: ref.repo, head: 'feature', state: 'any' },
+  } satisfies ForgeRequest;
+  expect((await dispatch(anyState, 'closed')).response).toMatchObject({
+    ok: true,
+    result: { value: { pr: { state: 'closed' } } },
+  });
+  // A plugin that does not declare it would answer for the open pull request only.
+  expect((await dispatch(anyState, 'no-any-state')).response).toMatchObject({
+    ok: false,
+    error: { kind: 'unsupported_op' },
+  });
+});
+
 test('a pull request that a head selector did not find audits as an absence', () => {
   const response: ForgeResponse = {
     operationId: 'none',
@@ -473,4 +490,131 @@ test('draft conversion accepts unchanged evidence and rejects a non-open read-ba
     error: { kind: 'invalid_response' },
     mutation: { outcome: 'outcome_unknown' },
   });
+});
+
+describe('review threads and issue bodies', () => {
+  const reply = {
+    operationId: 'reply-1',
+    op: 'pr.thread.reply',
+    ref,
+    thread: 'thread-1',
+    body: 'Fixed in abc123.',
+  } satisfies ForgeRequest;
+  const resolve = {
+    operationId: 'resolve-1',
+    op: 'pr.thread.resolve',
+    ref,
+    thread: 'thread-1',
+  } satisfies ForgeRequest;
+  const editIssue = {
+    operationId: 'issue-body-1',
+    op: 'workitem.edit-body',
+    ref,
+    body: 'The contract.\n\n## Current scope\n\nA ruling.',
+  } satisfies ForgeRequest;
+
+  test('thread comment bodies reach callers and only their digests reach the audit', async () => {
+    const result = await dispatch({ operationId: 'threads', op: 'pr.threads', ref });
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: { op: 'pr.threads', value: { threads: [{ id: 'thread-1', resolved: false }] } },
+    });
+    expect(JSON.stringify(result.response)).toContain('private thread body');
+    expect(JSON.stringify(result.audit)).not.toContain('private thread body');
+    expect(JSON.stringify(result.audit)).toContain(contentDigest('private thread body'));
+  });
+
+  test.each([reply, resolve, editIssue])(
+    'an applied $op that answers the request is accepted',
+    async request => {
+      expect((await dispatch(request)).response).toMatchObject({
+        ok: true,
+        result: { op: request.op, value: { outcome: 'applied' } },
+      });
+    }
+  );
+
+  test.each([reply, resolve, editIssue])(
+    'an applied $op that does not answer the request becomes outcome_unknown',
+    async request => {
+      expect((await dispatch(request, 'mismatch')).response).toMatchObject({
+        ok: false,
+        mutation: { op: request.op, outcome: 'outcome_unknown' },
+      });
+    }
+  );
+
+  test('conversation comment bodies reach callers and only their digests reach the audit', async () => {
+    const result = await dispatch({
+      operationId: 'comments',
+      op: 'workitem.comments',
+      subject: { kind: 'pr', ref },
+    });
+    expect(result.response).toMatchObject({
+      ok: true,
+      result: {
+        op: 'workitem.comments',
+        value: { comments: [{ id: '7', author: { login: 'maintainer' } }] },
+      },
+    });
+    expect(JSON.stringify(result.response)).toContain('private conversation comment');
+    expect(JSON.stringify(result.audit)).not.toContain('private conversation comment');
+    expect(JSON.stringify(result.audit)).toContain(contentDigest('private conversation comment'));
+  });
+
+  test('patches and file text reach callers and only their digests reach the audit', async () => {
+    const files = await dispatch({ operationId: 'files', op: 'pr.files', ref });
+    const file = await dispatch({
+      operationId: 'file',
+      op: 'repo.file',
+      repo: ref.repo,
+      path: 'src/a.test.ts',
+      revision: 'headsha',
+    });
+    for (const [result, content] of [
+      [files, 'private patch'],
+      [file, 'private file text'],
+    ] as const) {
+      expect(JSON.stringify(result.response)).toContain(content);
+      expect(JSON.stringify(result.audit)).not.toContain(content);
+      expect(JSON.stringify(result.audit)).toContain(contentDigest(content));
+    }
+    // A file the forge has no patch for stays distinguishable from an empty patch.
+    expect(files.audit.result).toMatchObject({
+      ok: true,
+      result: { value: { files: [{ path: 'src/a.test.ts' }, { path: 'logo.png', patch: null }] } },
+    });
+  });
+
+  test.each([
+    {
+      operationId: 'checks-1',
+      op: 'checks.commit',
+      repo: ref.repo,
+      at: { kind: 'revision', revision: 'asked' },
+    },
+    { operationId: 'merge-state-1', op: 'pr.merge-state', ref },
+    { operationId: 'file-1', op: 'repo.file', repo: ref.repo, path: 'src/a.ts', revision: 'asked' },
+  ] satisfies ForgeRequest[])('a $op read that answers the request is accepted', async request => {
+    expect((await dispatch(request)).response).toMatchObject({ ok: true });
+  });
+
+  test.each([
+    {
+      operationId: 'checks-1',
+      op: 'checks.commit',
+      repo: ref.repo,
+      at: { kind: 'revision', revision: 'asked' },
+    },
+    { operationId: 'merge-state-1', op: 'pr.merge-state', ref },
+    { operationId: 'file-1', op: 'repo.file', repo: ref.repo, path: 'src/a.ts', revision: 'asked' },
+  ] satisfies ForgeRequest[])(
+    'a $op read about another commit or pull request is an invalid response',
+    async request => {
+      expect((await dispatch(request, 'mismatch')).response).toMatchObject({
+        ok: false,
+        error: { kind: 'invalid_response' },
+      });
+    }
+  );
 });

@@ -46,9 +46,11 @@ export const workItemViewRequestSchema = requestBase.extend({
   ref: workItemRefSchema,
 });
 /**
- * A pull request by number, or the one open pull request for a qualified head.
- * The head form answers "does this branch already have a pull request", so it
- * resolves to nothing rather than to a pull request that was closed earlier.
+ * A pull request by number, or the pull request for a qualified head.
+ * The head form answers "does this branch already have a pull request", so by
+ * default it resolves only the open one, never one closed earlier. `state: "any"`
+ * asks instead for the newest pull request on that head in any state, which a
+ * plugin must declare it supports with `PR_VIEW_ANY_STATE`.
  */
 export const prViewRequestSchema = requestBase.extend({
   op: z.literal('pr.view'),
@@ -60,9 +62,16 @@ export const prViewRequestSchema = requestBase.extend({
       headRepo: repoRefSchema,
       head: text,
       base: text.optional(),
+      state: z.enum(['open', 'any']).optional(),
     }),
   ]),
 });
+/**
+ * The capability a plugin advertises when it answers a `pr.view` head selector
+ * with `state: "any"`. An older plugin would ignore the field and answer for the
+ * open pull request only, so the host refuses the request without it.
+ */
+export const PR_VIEW_ANY_STATE = 'pr.view:any-state';
 export const prCreateRequestSchema = requestBase.extend({
   op: z.literal('pr.create'),
   repo: repoRefSchema,
@@ -219,6 +228,116 @@ export const reviewItemSchema = z.object({
   body: z.string(),
 });
 export const prReviewsSchema = z.object({ ref: prRefSchema, items: z.array(reviewItemSchema) });
+/** Every review thread on a pull request, read in full: a partial list could hide an open one. */
+export const prThreadsRequestSchema = requestBase.extend({
+  op: z.literal('pr.threads'),
+  ref: prRefSchema,
+});
+export const reviewThreadCommentSchema = z.object({
+  id: text,
+  author: sourceActorSchema.nullable(),
+  body: z.string(),
+  url: z.url(),
+});
+export const reviewThreadSchema = z.object({
+  id: text,
+  resolved: z.boolean(),
+  outdated: z.boolean(),
+  path: z.string().nullable(),
+  line: z.number().int().nullable(),
+  comments: z.array(reviewThreadCommentSchema),
+});
+export type ForgeReviewThread = z.infer<typeof reviewThreadSchema>;
+export const prThreadsSchema = z.object({ ref: prRefSchema, threads: z.array(reviewThreadSchema) });
+/** Every conversation comment on an issue or pull request, oldest first, read in full. */
+export const workItemCommentsRequestSchema = requestBase.extend({
+  op: z.literal('workitem.comments'),
+  subject: forgeSubjectRefSchema,
+});
+export const workItemCommentSchema = z.object({
+  id: text,
+  author: sourceActorSchema.nullable(),
+  url: z.url(),
+  body: z.string(),
+});
+/** How far a pull request's head is behind its repository's default branch, and whether it merges. */
+export const prMergeStateRequestSchema = requestBase.extend({
+  op: z.literal('pr.merge-state'),
+  ref: prRefSchema,
+});
+export const prMergeStateSchema = z.object({
+  ref: prRefSchema,
+  head_revision: gitObjectIdSchema,
+  default_branch: text,
+  default_revision: gitObjectIdSchema,
+  /** Commits of the default branch at `default_revision` that the head at `head_revision` lacks. */
+  behind: z.number().int().nonnegative(),
+  mergeable: z.enum(['clean', 'conflict', 'unknown']),
+  /** The commit the pull request landed as; null until it is merged. */
+  merge_commit: gitObjectIdSchema.nullable(),
+});
+/** A reply on one review thread of the pull request `ref`. */
+export const prThreadReplyRequestSchema = requestBase.extend({
+  op: z.literal('pr.thread.reply'),
+  ref: prRefSchema,
+  thread: text,
+  body: text,
+});
+/** Resolve one review thread of the pull request `ref`. */
+export const prThreadResolveRequestSchema = requestBase.extend({
+  op: z.literal('pr.thread.resolve'),
+  ref: prRefSchema,
+  thread: text,
+});
+/** Every file a pull request changes, read in full: a partial list could hide a changed test. */
+export const prFilesRequestSchema = requestBase.extend({
+  op: z.literal('pr.files'),
+  ref: prRefSchema,
+});
+export const prFileSchema = z.object({
+  path: text,
+  /** The path before a rename or copy; null otherwise. */
+  previous_path: text.nullable(),
+  status: z.enum(['added', 'removed', 'modified', 'renamed', 'copied', 'changed', 'unchanged']),
+  /** The unified diff hunk; null when the forge has none, such as for a binary or very large file. */
+  patch: z.string().nullable(),
+});
+/**
+ * `head_revision` is the head the forge reported as the list was read, so a caller
+ * reads `repo.file` at the commit the patches belong to.
+ */
+export const prFilesSchema = z.object({
+  ref: prRefSchema,
+  head_revision: gitObjectIdSchema,
+  files: z.array(prFileSchema),
+});
+/**
+ * A repository-relative path. A `.` or `..` segment is refused rather than
+ * normalized: a forge URL built from it would resolve to another endpoint.
+ */
+const repoPathSchema = text.refine(
+  value => value.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..'),
+  'path must be repository-relative with no empty, . or .. segments'
+);
+/** One file's text at a commit. */
+export const repoFileRequestSchema = requestBase.extend({
+  op: z.literal('repo.file'),
+  repo: repoRefSchema,
+  path: repoPathSchema,
+  revision: gitObjectIdSchema,
+});
+export const repoFileSchema = z.object({
+  repo: repoRefSchema,
+  path: repoPathSchema,
+  revision: gitObjectIdSchema,
+  text: z.string(),
+});
+/** Replace an issue's body. */
+export const workItemEditBodyRequestSchema = requestBase.extend({
+  op: z.literal('workitem.edit-body'),
+  ref: workItemRefSchema,
+  body: z.string(),
+});
 export const landedSchema = z.object({
   commit: gitObjectIdSchema.nullable(),
   tree: gitObjectIdSchema.nullable(),
@@ -240,7 +359,12 @@ export const lifecycleReadRequestSchemas = [
   prViewRequestSchema,
   repoLabelsListRequestSchema,
   prReviewsRequestSchema,
+  prThreadsRequestSchema,
   workItemListRequestSchema,
+  workItemCommentsRequestSchema,
+  prMergeStateRequestSchema,
+  prFilesRequestSchema,
+  repoFileRequestSchema,
 ] as const;
 export const mutationRequestSchemas = [
   prMergeRequestSchema,
@@ -257,6 +381,9 @@ export const mutationRequestSchemas = [
   workItemLabelAddRequestSchema,
   workItemLabelRemoveRequestSchema,
   repoLabelEnsureRequestSchema,
+  prThreadReplyRequestSchema,
+  prThreadResolveRequestSchema,
+  workItemEditBodyRequestSchema,
 ] as const;
 export const mutationRequestSchema = z.discriminatedUnion('op', mutationRequestSchemas);
 export type ForgeMutationRequest = z.infer<typeof mutationRequestSchema>;
@@ -272,16 +399,48 @@ export const workItemViewSchema = subjectRecordSchema.extend({
   labels: labelNamesSchema.optional(),
   author: authorSchema,
 });
+const timestamp = z.iso.datetime({ offset: true });
+/**
+ * When a pull request was opened, merged and closed. A merged pull request's
+ * `closed_at` is whatever the forge reports: GitHub sets it, GitLab does not.
+ */
+export const prTimestampsSchema = z.object({
+  created_at: timestamp,
+  merged_at: timestamp.nullable(),
+  closed_at: timestamp.nullable(),
+});
 export const prViewSchema = z.object({
   pr: forgePrRecordSchema,
   title: z.string(),
   body: z.string(),
   author: authorSchema,
+  // Absent means the plugin does not report timestamps, as an older protocol-1 plugin does not.
+  timestamps: prTimestampsSchema.optional(),
+});
+/** Timestamps that contradict the pull request's state are a malformed answer, not a fact. */
+const prViewResultSchema = prViewSchema.superRefine(({ pr, timestamps }, ctx) => {
+  if (!timestamps) return;
+  const consistent =
+    pr.state === 'open'
+      ? timestamps.merged_at === null && timestamps.closed_at === null
+      : pr.state === 'merged'
+        ? timestamps.merged_at !== null
+        : timestamps.merged_at === null && timestamps.closed_at !== null;
+  if (!consistent)
+    ctx.addIssue({
+      code: 'custom',
+      message: `Timestamps must agree with a ${pr.state} pull request`,
+      path: ['timestamps'],
+    });
 });
 export const workItemListSchema = z.object({
   repo: repoRefSchema,
   label: text,
   items: z.array(subjectRecordSchema),
+});
+export const workItemCommentsSchema = z.object({
+  workitem: subjectRecordSchema,
+  comments: z.array(workItemCommentSchema),
 });
 export const commentRecordSchema = z.object({
   ref: prRefSchema,
@@ -338,10 +497,15 @@ const appliedSchema = z.object({
 
 export const lifecycleReadResultSchemas = [
   z.object({ op: prReviewsRequestSchema.shape.op, value: prReviewsSchema }),
+  z.object({ op: prThreadsRequestSchema.shape.op, value: prThreadsSchema }),
   z.object({ op: workItemViewRequestSchema.shape.op, value: workItemViewSchema }),
-  z.object({ op: prViewRequestSchema.shape.op, value: prViewSchema.nullable() }),
+  z.object({ op: prViewRequestSchema.shape.op, value: prViewResultSchema.nullable() }),
   z.object({ op: repoLabelsListRequestSchema.shape.op, value: repoLabelsListSchema }),
   z.object({ op: workItemListRequestSchema.shape.op, value: workItemListSchema }),
+  z.object({ op: workItemCommentsRequestSchema.shape.op, value: workItemCommentsSchema }),
+  z.object({ op: prMergeStateRequestSchema.shape.op, value: prMergeStateSchema }),
+  z.object({ op: prFilesRequestSchema.shape.op, value: prFilesSchema }),
+  z.object({ op: repoFileRequestSchema.shape.op, value: repoFileSchema }),
 ] as const;
 export const mutationResultSchemas = [
   z.object({
@@ -420,6 +584,18 @@ export const mutationResultSchemas = [
   z.object({
     op: workItemCloseRequestSchema.shape.op,
     value: appliedSchema.extend({ workitem: workItemRecordSchema, reason: closeReasonSchema }),
+  }),
+  z.object({
+    op: prThreadReplyRequestSchema.shape.op,
+    value: appliedSchema.extend({ thread: text, comment: commentRecordSchema }),
+  }),
+  z.object({
+    op: prThreadResolveRequestSchema.shape.op,
+    value: appliedSchema.extend({ thread: text, resolved: z.literal(true) }),
+  }),
+  z.object({
+    op: workItemEditBodyRequestSchema.shape.op,
+    value: appliedSchema.extend({ workitem: workItemRecordSchema, bodyDigest: text }),
   }),
 ] as const;
 

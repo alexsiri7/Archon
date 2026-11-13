@@ -7,6 +7,209 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-07
+
+The SDLC pack reaches GitHub only through the forge plugin, packs can declare settings, and `archon metrics` measures the factory.
+
+### Breaking
+
+- The bundled SDLC pack reaches the forge only through `archon forge` and an installed forge plugin; the pack's `gh` path is gone and nothing falls back to `gh`. Install the plugin with `archon plugin add coleam00/Archon/plugins/forge-github`. Delivery and the merge queue need plugin v0.13.0 or later, and their forge checks refuse a plugin missing an operation they need; the metrics workflows and the build queue's lookup of a dead round's pull request need this release's plugin, for `pr.view` timestamps, `pr.view` of a head in any state, `pr.files` and `repo.file`. Your existing `gh auth login`, `GH_TOKEN` or `GITHUB_TOKEN` is still the credential, and a leftover `ARCHON_SDLC_FORGE` is ignored. A pack run in a container refuses at its forge check, since a container has no host command. The merge queue's own-PR enrollment notes that the forge cannot list a maintainer's pull requests and continues with the queue's other work. A red default branch is now always raised to a maintainer instead of rerun, because the forge reruns checks only on a pull request. (#5222, #5365)
+
+### Added
+
+- A pack can declare settings once in `<pack>/.pack/pack.yaml`, and a project sets them in `.archon/packs/<pack>.yaml`. Every workflow of the pack reads them as inputs; an unknown key or a wrong-typed value refuses the run, naming the file and the key. (#5342)
+- `archon project config <id|name>` and `GET /api/codebases/{id}/config` show a project's merged config with secrets and env values removed. (#5334)
+- `archon metrics` and `/api/metrics` aggregate metrics that nodes return across runs, compare runs before and after a change with intervals and cost, compare the models that ran one step, report factory PR counts and merge rate attributed to the runs that built each PR, and count factory tests that protect no behavior, with the judge's agreement against hand labels. The test-value judge judges each test on its own merits and also reads tests defined outside test files. (#5314, #5319, #5323, #5324, #5329, #5346)
+- The console metrics page shows trends, judge calibration, and the overview cards a pack declares, with a Details screen. (#5339, #5354)
+- A run can hold a lease on a state document (`archon state put|patch --lease`, `--release-lease`). Reads report whether the lease is live from the holder run's status, and the engine never ends a lease on age. The SDLC pack's claims use it. (#5366)
+- Attention waits carry a recommendation, what each option does, and a value returned with the answer. (#5367)
+- The attention queue streams over SSE for HTTP clients. (#5387)
+- A run started by a trigger binding is recorded as the start's requester. (#5368)
+- A node can read which nodes in its run failed, were skipped or completed. (#5361)
+- A node can read its own pack's directory as `$PACK_DIR`. (#5363)
+- A loop that runs out of iterations can complete with its last output instead of failing the run. (#5362)
+- The forge contract can read pull request timestamps, a pull request's files, and a file at a commit. (#5379)
+- SDLC pack: the build queue can build only the work items an operator put in a work order (`orders_only`). (#5390)
+- SDLC pack: a large item is split into issues only when it can't be built as one; a PRD splits into phases that each prove an outcome. (#5322)
+- SDLC pack: review's code lens uses a user-facing change in a browser, and a new ux lens judges a UI change as its operator would. (#5389, #5392)
+
+### Changed
+
+- Built-in Codex defaults use the GPT-6.1 models. (#5378)
+- SDLC pack: queue follow-up runs start through the operator's trigger bindings, so binding capacity and deduplication apply to them. (#5369)
+- SDLC pack: the build queue stops relaunching a pull request that changed nothing since its last review. (#5303)
+- SDLC pack: transient GitHub read failures are retried, a dated scope ruling can settle a review thread, and the merge sweep decides a pull request with no Ready verdict at its head before reading any diff. (#5393)
+- SDLC pack: prompts point at the policy documents instead of restating them, and the pack keeps only the tests that guard a write or a gate. (#5364, #5382, #5385)
+- Metrics reports return in seconds and no longer block the server. (#5384)
+- Container image cleanup goes through the selected isolation backend, and Docker verification images are removed when runs finish. (#5311, #5338)
+- Worktree reuse on the wrong branch is refused. (#5292)
+- A Codex output schema that Codex cannot honor is refused before the agent runs. (#5291)
+- Partial workflow run reads reject unsupported statuses. (#5294)
+- Windows taskkill failures and Codex shutdown phases report diagnostics. (#5288, #5302)
+
+### Fixed
+
+- HTTP workflow launches resolve continuation targets the same way the CLI does, and reject unknown, ambiguous or still-running targets with a 400 before any work starts. (#5305)
+- Fan-out results are consistent across workflow types. (#5386)
+- Host workflow results survive a Docker image inventory failure. (#5333)
+- Multiline inline Bun scripts survive a Windows cmd shim. (#5308)
+- Plain loops survive an unreadable parent status. (#5284)
+- SSE heartbeat loops end after the client disconnects. (#5295)
+- Reconnects survive an OAuth refresh. (#5297)
+- The attention queue reports paused runs it cannot read, `/status` says when it cannot read the worktree inventory, and draft run launch refusals are shown in full. (#5280, #5296, #5298)
+- macOS cleans up exited plugin process groups. (#5310)
+- OpenCode retries server startup only on a structured port conflict. (#5304)
+- SDLC pack: a cancelled build round's pull request is recorded when its claim is released, and the build queue's answer no longer stalls on Codex when it has no ask class to declare. (#5313, #5326)
+
+## [0.13.2] - 2026-10-29
+
+Upgrading from 0.13.0 with providers installed works in one command again.
+
+### Fixed
+
+- `archon provider add` and `archon plugin update` now replace a maintained provider installed by 0.13.0, whose receipt declares the older plugin protocol, including several providers in one command. On 0.13.1 they refused, saying the executable "may belong to a plugin whose receipt cannot be read", so the documented upgrade step failed and workflows that used that provider stopped loading. A file with an unreadable receipt or a different plugin ID is still refused, and the existing repair for a provider's own malformed receipt is unchanged. (#5287)
+- `archon isolation cleanup` help and the CLI reference describe the container threshold as age since the environment was created, which is what cleanup uses. (#5283)
+- The source-install guide points to the Bun version the repository pins instead of `>= 1.0.0`. (#5275)
+
+## [0.13.1] - 2026-10-29
+
+Workflow names must match exactly, provider plugins move to protocol 3, and a batch of fixes for Postgres boots, Codex runs, cleanup and cost accounting.
+
+### Breaking
+
+- The provider plugin protocol is now 3. After upgrading, run `archon provider add` again for each provider you use. Third-party provider plugins must rebuild against protocol 3. A provider installed by 0.13.0 is reported as unavailable, naming its protocol, this Archon's protocol and the command that fixes it, instead of failing workflow discovery with `Invalid input`. (#5252, #5270)
+- Workflow names resolve by exact name everywhere: `archon workflow run`, the chat `/workflow` command, the run API, `workflow:` children, `include:`, composed fan-outs and resume. `archon workflow run review` no longer selects `archon-review`; the error suggests the closest names instead. A `workflow:` or `include:` target that is not an exact name fails to load, so adding a workflow can no longer change which child runs. Project-name matching is unchanged. (#5259)
+- Output field references accept properties declared through `allOf`, `anyOf` and `oneOf`, including nested compositions and schemas without root properties. A reference to a field that a composition-only schema declares nowhere now fails at load instead of being read schemaless. (#5255)
+
+### Changed
+
+- SDLC build queue: before it continues an item, the answer checks the whole change against the issue's contract and asks when a correction would add machinery the contract does not name, naming the subtractive option. Review proposes removing machinery a change added before extending it. A Ready, green pull request whose only remaining check no round can run is asked about once instead of relaunched. The answer declares its question's class (`stop` or `scope`), and the queue records that class instead of deriving it from the round count. (#5266)
+
+### Fixed
+
+- PostgreSQL: a boot that finds the schema current skips convergence, and so takes no lock and runs no DDL. Deadlock and serialization victims (40P01, 40001) retry, and concurrent boots on a fresh database recover from schema deadlocks, so a status query or timer tick no longer kills a live run with "deadlock detected". (#4543, #5249)
+- A provider turn that stays silent after its result now fails at the node's `idle_timeout` instead of hanging the run indefinitely. (#5252)
+- A usage-limit wait across a fan-out or loop group no longer resumes before the reset a provider reported. (#5250)
+- Codex: a "no usable login" credential check is rechecked once in a fresh process, so concurrent runs sharing one refreshing login are not refused. Schema conversion keeps conditional `oneOf`/`anyOf`/`allOf` output schemas satisfiable, and a shape it cannot express is refused before the run with the keyword and path. (#5245, #5253)
+- Abandoning a run keeps the checkout of a sub-run whose owner may still be live instead of deleting it. A crash before a container write-back apply no longer resumes as applied and discards the overlay. (#5251, #5243)
+- Cleanup of an unregistered checkout, and terminal writes in the file store, no longer hold a lock while they delete files or walk artifacts. (#5238, #5242)
+- A refreshed OAuth credential keeps its label, and a lost token rotation is reported as needing a reconnect instead of healthy. (#5240)
+- When the newest of several servers on one Archon home stops, `server.json` is handed to a server still listening instead of being removed. (#5237)
+- On Windows, a registered repository is no longer refused as "a different clone" when its path differs only in slash direction or drive-letter case. (#5244)
+- A run blocked because another worktree holds its branch names that worktree. (#5258)
+- Resume keeps the setup error when the run cannot be marked failed. Workflow run reads reject an unsupported stored status instead of acting on it. (#5241, #5265)
+- A dropped SSE reconnect during replay keeps its buffered events. (#5239)
+- Loop and fan-out cost totals keep a partial cost marked partial across iterations, resume and retries. (#5262)
+- `/status` keeps its worktree totals when the base branch cannot be resolved. (#5263)
+- A forge plugin file that cannot be inspected is reported instead of aborting discovery or silently disappearing. (#5264)
+- Dry runs keep an explicit `null` stub, and `workflow run --resume` help says it also selects stale running runs. (#5261, #5260)
+
+## [0.13.0] - 2026-10-28
+
+Slack runs only as a plugin. Declared MCP servers and misplaced node keys fail before any tokens are spent. Completed runs clean up their own worktrees and scratch space. The SDLC merge queue merges clean PRs at once, and queue answers continue without waiting for the next pass.
+
+### Breaking
+
+- The server no longer contains a Slack adapter; Slack runs only as the `chat-slack` plugin. Docker images ship a verified release and install it offline on startup when `SLACK_BOT_TOKEN` is set, including on existing volumes, and boot logs explain what was installed; valid installed versions are kept. Removing the plugin while tokens are still set reinstalls it on restart, so remove the tokens from every env source too to keep Slack off. Outside Docker, run `archon plugin add coleam00/Archon/plugins/chat-slack` and restart. A token without an installed plugin logs `chat.bundled_adapter_retired` with the Docker guidance and the manual command. The Slack app, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_ALLOWED_USER_IDS`, `SLACK_STREAMING_MODE`, and existing Slack conversations, linked identities and workspaces are unchanged. In Slack, `/archon connect github` now points to the Web UI or `archon auth github` instead of running the device flow. Remove the plugin before downgrading to a release without chat plugin support, which rejects its receipt. (#4659, #4792)
+- Public `GET /api/health` no longer lists conversation IDs: `concurrency.activeConversationIds` and `queuedByConversation` are gone, replaced by `oldestActiveAgeMs` and `oldestQueuedAgeMs`. A monitor that read the removed fields should use the new authenticated `GET /api/dashboard/conversations`, which shows when each conversation took its slot and how long its messages have waited. (#4654)
+- SDLC pack inputs are removed: `order` from `archon-intake`, `archon-build-queue` and `archon-merge-queue` (queues always claim in the old default order), `trust` from `archon-intake` (trust comes only from `maintainers.json`), and the eval/replay `mode` input from every queue and `archon-discoveries`. A launch, trigger binding or timer that still passes one of them fails to start because the workflow no longer declares it; drop the input. (#4574, #5015, #5018)
+- SDLC policy files in `.archon/sdlc/policy/` now add to the pack default and win where the two conflict, instead of replacing the default whole. A project file that copied the whole default still works; a file that left default rules out to disable them now gets those rules back, so state the override explicitly. (#4794)
+- The SDLC pack calls a stop that needs a decision `ask` instead of `needs_human`: the review action, the delivery round ending, the settle-threads output (`settle_ask`, `INPUTS_SETTLE_ASK`) and the `archon-ship` stop reason. A custom workflow or script that matched `needs_human` or bound the old settle-threads output must use the new names. (#4621)
+- A Claude or Codex node now fails as `misconfigured` before its first model turn when a declared `mcp:` server fails to connect, needs auth, is disabled or is missing, instead of warning and running without its tools. `optional: true` still covers a missing file or a provider without MCP support, but not a loaded server that fails. Copilot is unchanged. (#4782)
+
+### Security
+
+- Logs no longer record text that could come from users or models: Codex's unparseable app-server lines log only their byte length, workflow YAML parse failures log no source excerpt or parser message (authors still see the full error), and title generation logs only the conversation ID and event. (#4506, #4926, #4946)
+- Container runs can no longer redirect host writes. Engine writes under `$ARTIFACTS_DIR` refuse a symlinked parent directory and replace a symlinked file, and the artifact collision check no longer follows a symlink or blocks on a FIFO the container placed at an artifact's metadata path. (#4731, #4824)
+
+### Added
+
+- `archon workflow artifacts <run-id> [path]` lists a run's artifact files or prints one, and `archon project list` lists registered projects with the key `--project` accepts. Both take `--json` and need no running server. (#4653)
+- `archon workflow end-turn <run-id>` ends a stalled tool call or background-work turn without cancelling the run. The turn fails as `timeout` and the node's retry policy applies. (#4620)
+- `archon workflow run --project owner/repo --cwd <other clone>` runs a workflow from another clone under a registered project without registering the clone, and `--config-from-run <run-id>` starts a fresh run with the `--config` layer another run started with. (#4652, #4843)
+- Foreground run completion and `archon workflow get` show the run's recorded cost and input and output tokens, or `unknown`. (#4854)
+- Each run gets a scratch directory, `$ARTIFACTS_DIR/.archon/scratch/`, deleted once the run is completed, failed or cancelled and its owner process is gone. The SDLC pack puts throwaway checkouts and `node_modules` there. (#4888)
+- A `workflow:` fan-out records each child's outcome (completed, failed, not started, or cancelled with its cause) and a tally as `fan_out_outcome`, shown by `archon workflow get`, the run API and the console. `max_parallel: all` starts every child at once, so each can raise its attention item in one pass and be answered on its own. (#4791, #4962)
+- A command or prompt node in a `loop_group` body can fork the session of an earlier node in the same iteration with `context: { resume: <node> }`. (#4738)
+- `model:` accepts a preference list of `@aliases` ending in a tier or model id, such as `['@review-seams', '@reviewer', medium]`. The first alias the run's config defines wins, otherwise the last entry; `--model @alias=<model>` can bind an alias no config defines. (#4624)
+- `assistants.codex.toolFreeStructuredOutputModels` lists Codex models whose route rejects tools together with a strict schema. Those models run their tool turns without the schema and then one tool-free final turn with `output_format`. (#4657, #4906)
+- Chat assistants with native tools can start workflows that declare required inputs: `invoke_workflow` takes `inputs`, and a missing input goes back to the assistant so it can ask. (#4651)
+- GitHub Enterprise Server works through `GITHUB_URL`: the GitHub adapter's PAT, App and per-user clients call `<GITHUB_URL>/api/v3`, HTTPS clones on that host get the token, and forge calls keep a configured HTTP scheme and port. App-mode git operations after the first clone and `*.ghe.com` are not covered yet. (#4658, #4873, #4958)
+- Local clients can find a running server in `$ARCHON_HOME/server.json` and confirm it serves that home by comparing `storeId` from `GET /api/health` with the home's `store-id` file. (#5068)
+- `archon workflow attention --watch` lines carry each run's `workflow` and `parentRunId`, and a failed run's `terminal` line carries `cause: { node, errorClass }`. (#5065)
+- Workflow fixtures can assert an authored verdict with `fixture.authored: succeeded|failed`, and dry runs report the verdict a return node produced. (#5062)
+- The forge contract gains `pr.threads`, `pr.thread.reply`, `pr.thread.resolve`, `workitem.edit-body`, and reads for comments with authors, checks at a revision or on the default branch, and a pull request's behind count and mergeability. The GitHub forge plugin implements them. (#4585, #5016)
+- SDLC pack additions:
+  - `archon-build-queue --input number=<issue>` claims and builds that issue, and each pack stage names a model alias (`@triage`, `@planner`, `@investigator`, `@implementer`, `@reviewer`, `@review-<lens>`) that falls back to its old tier, so one stage can move to another model. (#4611, #4627)
+  - A maintainer who opts in through `maintainers.json` gets their own open PRs merged through the merge queue, and an answer that continues an item launches the follow-up run at once on the answered run's config. (#4663, #4728)
+  - Every build and merge queue question offers `other`; its text is written into the issue body as a dated ruling and the item continues from it. A maintainer can also hand a build item's PR to the merge queue with a `ready` answer. (#4561, #5178)
+  - With `retriage_as` set, the build queue revisits blocked items and the merge queue re-triages an issue still open after its PR merged. (#4618, #4991)
+  - On the `forge` source, delivery answers and resolves review threads, rulings reach the issue body, labels change one at a time, and the merge queue runs. The preflight now requires these operations: update the GitHub forge plugin to v0.13.0 with `archon plugin update coleam00/Archon/plugins/forge-github`, since v0.12.1 is refused. (#4625, #5016, #5232)
+  - Triage reports related items from every comment, and plan reads them as a new `related` input. `archon-pr` takes a `publish_description` input that delivery uses to publish the PR description before review reads it. (#4673, #4879)
+
+### Changed
+
+- A workflow node that carries a key belonging to another node type, or a loop setting outside `loop:` or `loop_group:`, now fails the workflow load instead of being ignored or only warned about. For example, `runtime: bun` on a `prompt:` node or a top-level `interactive: true` on a `command:` node is a load error naming the node, the key and the node types that support it. Move the key to a node that honours it, or delete it. Wrong-key and legacy `steps:` errors are shorter and point to the authoring guide. (#4655, #4840)
+- A completed run removes the worktree it created on its own run-named branch when the checkout is clean and every commit is on a remote, published or not. Branches are kept, `--branch` worktrees are never removed, and a kept worktree prints a warning naming its path. The read-only SDLC workflows (intake, triage, discoveries, merge queue) no longer create a worktree. (#4915)
+- A credential preflight refuses a run only for a definite bad credential (`unusable`, `not_connected`). An inconclusive check starts the run and records a `credential_check_inconclusive` event; the probe now has 60 s instead of 20 s, and a timeout says so. (#4963, #5189)
+- Runs in an unregistered working directory store their output under `@cwd/<basename>-<digest>`, where the digest comes from the directory's full path, so two directories with the same folder name no longer share `$STATE_DIR`. Moving a directory gives it a new root. Existing `_cwd/<basename>` trees are left in place and no longer read; when one exists, a run logs its location and the new root so you can move state that belongs to that directory. Resumed runs keep their recorded root. (#4637)
+- Chat no longer treats `/invoke-workflow` or `/register-project` lines in an assistant reply as commands. OpenCode and Copilot launch through the detached CLI after project selection, and registering a project on them needs an explicit user `/register-project`. (#4849)
+- Answering a wait no longer re-runs nodes that failed before the pause; their failures are replayed and their dependents keep cached results. `archon workflow resume` of a failed run still retries them. An answered attention wait whose question changed on resume, including inside a loop group, discards the old answer and asks again, recording `reaskedFrom`. (#4677, #4682, #4903)
+- GitHub webhooks for an existing registration no longer sync (`git reset --hard`) the checkout, matching GitLab and Gitea, and a project registered at a subdirectory of a checkout uses its saved path instead of trying to clone. (#4507)
+- Pi nodes with `output_format` answer through a terminating `structured_output` tool call validated in the session, instead of having the transcript scraped, so thinking-only models such as Bedrock GLM work. (#4899)
+- A provider plugin protocol failure names what was wrong (malformed JSON, or the schema path and issue code), the message name when the host handles it, the line length and the plugin version, in both the node error and the `provider.plugin.protocol_failed` log, without recording any text from the message. Codex shutdown events reach the host log as `provider.plugin.log`. (#4930, #4943)
+- `archon doctor` no longer checks SDLC forge access, and its exit code no longer depends on it. Run `archon workflow run archon-forge-check` from a checkout instead: the new bundled workflow runs the same check the pack's delivery workflows run first and names the credential source it used or why it refused. (#4441)
+- Server telemetry reports how many chat plugins it hosts (`chat_plugins`), and `adapter_slack` now means the Slack plugin is installed rather than that Slack tokens are set. Plugin IDs are not sent. Telemetry `schema_version` is 11. (#4659)
+- The console no longer shows a run as live when its owner process is gone: it reads "owner not answering" or "owner unknown", stops the live animations and offers Abandon. The run detail API gains the owner observation. (#4660)
+- `archon workflow get` shows engine artifact files as a count and at most 20 other artifact paths; `--json` stays complete. (#5040)
+- The chat router no longer names bundled SDLC workflows in its examples, shows a deprecated workflow's message, and does not recommend a deprecated workflow when a current one fits. (#4527)
+- A loop added in the console builder starts with a shell completion check instead of the deprecated `until: COMPLETE`. (#5069)
+- The bundled `archon-cli` skill teaches launching the SDLC queues with inputs, watching every run on one `workflow attention --watch` stream, `workflow end-turn`, `--project` launches, and authoring through validate, dry run and fixtures. (#4626, #4832, #4858)
+- SDLC merge queue: it merges a Ready, CI-green PR that the forge reports as cleanly mergeable in the same sweep, without syncing, pushing, re-reviewing or waiting for CI; conflicts go back to the build queue. It refuses a Ready verdict given at another commit and a red default branch. Unresolved review threads hold a merge only when one raises a defect in what the PR changes. Changes under `.archon/` always ask, and a dated Current scope ruling that authorizes merge counts as approval. (#4500, #4551, #4642, #4686, #4785, #4908, #5091)
+- SDLC review and delivery: review blocks on a test gap only when the behavior matters and the test is worth keeping, sends scope questions to an `ask` instead of `replan`, and asks for a `correct` round when it raises the same finding twice. Plan maps every acceptance item, invariant and constraint to steps. The CI node no longer suggests a polling loop and tells the agent not to wait with a bare `sleep`. Discoveries files small findings in one area together as one `Cleanup: <area>` issue. (#4517, #4612, #4649, #5029, #5172, #5184)
+- SDLC queue mechanics: a continued build round starts from the PR's head, and route can mark an already finished PR `ready` without a paid round. Queue pickup reads all work items in one `archon state` call, and an idle pass names stored items it could not act on. Build and merge queue follow-up runs keep the launching run's inputs. The PR-body and merge steps follow the issue's ruling on whether a PR closes its issue. (#4573, #4646, #4647, #4721, #4878, #5173)
+
+### Deprecated
+
+- The Copilot and OpenCode providers and the Telegram adapter are deprecated: no Archon maintainer owns them. They stay bundled and keep working, with no removal scheduled. Each warns once per command or process and points to the plugin guide; Telegram logs `telegram.deprecated`. (#4650, #5232)
+
+### Removed
+
+- The one-time warnings for repo-local `.archon/state/`, `.archon/artifacts/`, `.archon/logs/` and the old home workflow directory are gone. These locations are neither read nor migrated automatically. To move old state, set `STATE_DIR` in your shell to the destination your workflow uses, then run `mkdir -p "$STATE_DIR"` and `mv .archon/state/* "$STATE_DIR"/` from the repository, and update workflows to use `$STATE_DIR`. The glob moves non-hidden entries; check hidden entries and destination conflicts before moving them. For home workflows, with `ARCHON_HOME` set to your Archon home (default `~/.archon`), run `mv "$ARCHON_HOME/.archon/workflows" "$ARCHON_HOME/workflows"` if the destination does not exist; otherwise merge the files by hand. Old artifacts and logs stay where they were; inspect them by hand, since run-scoped destinations make a bulk move unsafe. The separate notice for legacy `_cwd/<basename>` storage remains. (#4877)
+- The `script:` node no longer warns when a body still uses a literal `$ARGUMENTS`, `$USER_MESSAGE` or `$CONTEXT`; the one-release migration warning is gone. These variables are not substituted in a `script:` body, so the literal text stays in the source. Read them from the environment instead: `process.env.ARGUMENTS` (bun) or `os.environ['ARGUMENTS']` (uv/python). (#4793)
+- The SDLC pack drops the `assert-changed` guard after each implement turn, which only produced false failures, the unused `comparison` path of `archon-validate` (with its `interaction` cause and `evidence` pointer), and the intake backlog bench. (#4532, #4537, #4574)
+
+### Fixed
+
+- A Codex node no longer fails with `Provider plugin codex protocol failed ... (invalid_message): provider stream ended before settled` after its turn finished. With many Codex nodes ending together, Codex often took more than three seconds to exit after stdin closed, and the SIGTERM Archon then sent made it wait about 40 seconds and exit 1. After a turn, Archon now waits for Codex to exit without sending SIGTERM, logging `codex.app_server_still_exiting` every 30 seconds while it waits. Cancelling the run still interrupts Codex and sends SIGTERM if it does not exit. A non-object JSON line from Codex is ignored and logged instead of crashing the reader. (#4936, #4944, #4949, #4994)
+- Claude subscription logins pass credential preflight again, and CLI runs under `store: files` with a user identity use the provider's own login. A Claude resume rejected because the transcript is gone retries once on a fresh session when no output was produced yet. (#4631, #4734, #4967)
+- A run stopped by a provider usage limit with a known reset now pauses and resumes at the reset even when a downstream `all_done` node also failed, at top level, in loop groups and in composed fan-outs. (#4954)
+- Loops and loop groups behave as an uninterrupted run would: `until_bash` sees the current iteration's typed artifacts and, after a resume, both the current and previous outputs; large `$work.output` and `$LOOP_PREV` values no longer overwrite each other; a failed loop group body fails the run instead of leaving it paused; an `include:` gated on `$LOOP_PREV` runs or skips as one block; a nested terminal wait resumes in the outer iteration that paused; and dry runs of a body ending in a gate take the work node's output. (#4614, #4636, #4709, #4749, #4762, #4920, #5089)
+- Resume restores the oversized `bash:`/`script:` output that belongs to the resumed event, and a paused run's wait stays answerable when a newer Archon added a field to it. (#4781, #4821)
+- Bash nodes, loop completion checks and dry runs pass the resolved script on stdin, so several large inline references no longer hit the OS argument-length limit. (#4716)
+- Run cost and token totals are complete: a loop that throws after a paid iteration keeps its spend, an approval `on_reject` rework turn counts, OpenCode counts every assistant message and every sub-agent's cost, a failed direct-chat turn reports what it spent, malformed counters make a total unknown instead of partial, resumed runs leave an unreported cost absent instead of `$0`, and the console shows a reported `$0.0000`. (#4615, #4630, #4635, #4662, #4718, #4950, #4951, #4976, #5067)
+- Runs no longer stay `running` with no owner after a store failure during source setup, a refused adoption, or a detached launch whose workflow source disappeared; they end `failed` or `launch_failed`. (#4613, #4845, #4911)
+- SQLite holds its write lock for less time: startup on a current database takes no writer lock and a needed upgrade waits for a busy writer instead of failing, finishing a run walks its artifacts outside the transaction with a bounded manifest, and removing a worktree runs outside the transaction. (#5190, #5191, #5192)
+- Worktree safety: `archon complete` and other cleanup refuse to remove a worktree whose registration was replaced after it was selected, a repository cloned under a git `insteadOf` rewrite can be reused, a repository owned by another user (such as a root-owned Docker bind mount) registers instead of returning HTTP 500, a managed checkout saved with a trailing slash or dot segment is re-verified or recloned instead of refused, and `/status` shows a failed merge inspection separately. (#4633, #4661, #4712, #4822, #5088)
+- Container runs stop their container before an approval or write-back pause becomes resumable, restart it on resume only after the store admits the resume, stop it while waiting to retry an unreadable source, and report a failed container cleanup after a gate rejection. (#4844, #4934, #4941, #5053)
+- An isolated `workflow:` child's `$BASE_BRANCH` names the branch its worktree was cut from, and a composed fan-out that cannot read its parent's status stops with an interruption instead of a false node failure. (#4643, #4932)
+- `mutates_checkout: false` catches writes to an already-dirty file or new files in an untracked directory. (#4616)
+- Process control: a timed-out `bash:`/`script:` node in a detached POSIX run confirms its process group is gone before reporting the timeout, cancelling a run warns that background jobs from completed nodes may still run, and on Windows `workflow cancel` and `abandon` stop every process in the run owner's job without targeting an exited root whose PID could be reused. (#4656, #4848, #4939, #5064)
+- `workflow abandon` on a parent with more than 500 leaf children no longer reports false cancellation failures. (#4638)
+- Attention: a project-bound chat sees only its own project's paused gates, `--watch` reports an owner loss once per claim and fails at startup when the listener rejects the first delivery, a lost label race always reports `StaleGateAnswerError`, and the stream skips a run it cannot read with a `degraded` line instead of stalling. (#4511, #4634, #4711, #4901, #4955)
+- Triggers: a guarded start whose checkout is held by another run queues and names the blocker instead of being cancelled, a damaged start receipt no longer blocks other queued starts, and an unsupported stored run status is reported instead of treated as missing. (#4846, #4931, #4975)
+- Stored workflow statuses Archon does not know raise `WorkflowStatusReadError` naming the run and value, in the store, isolation cleanup and the container list. (#4853, #4927)
+- A chat dispatch that names a run to supersede is refused when it would continue an existing run, and a batch-mode turn made only of tool indicators replies with its messages instead of `---`. (#4542, #4710)
+- HTTP API: the workflow launch and conversation-message routes publish their request bodies in OpenAPI and the generated types, a multipart `files` part that is not a file returns 400 instead of being dropped, and a launch body that is not a JSON object returns 400 instead of 500. (#4894, #5050, #5051, #5052)
+- `GET /api/codebases` lists a repository once across trailing-slash, `.git`, SSH/HTTPS and case variants, renaming a project to a name another one uses in any case is refused, and one legacy relative-path registration no longer breaks commands in a healthy project. (#4508, #4789, #4827)
+- CLI: `--config` and `--config-from-run` are refused before `forge`, `workflow wake` and `workflow signal` start instead of being ignored, and a rejected `--config` emits the JSON envelope under `--json`. Help shows `setup --scope`, `workflow reset-sessions`, `workflow event emit` and `workflow attention label`'s own flags. (#4869, #4905, #4960, #5055)
+- `archon setup` writes the docs path into the project the skill went to and into a freshly bootstrapped config, and `--spawn` works in macOS Terminal, the xterm fallback and `x-terminal-emulator`, falling back to the next terminal or manual steps when one is missing. (#4632, #4714, #4829, #4923, #5054)
+- `archon serve` extracts the web UI in-process instead of spawning `tar`, which stalled on Windows. (#5086)
+- File store: Windows renames retry busy handles for up to 2 s, and locking removes empty or torn scratch files once their owner is gone. (#4513, #4952)
+- `workflow wake --watch` reports a resumed run's outcome before scratch cleanup, concurrent starts print the legacy cwd storage notice once per directory, and failed `bash:`/`script:` nodes in dry runs and fixture reports show bounded, redacted output tails. (#4925, #4995, #5049)
+- Two run-state store failures that used to vanish now log a warning with the run, the operation and a recovery step. (#4771)
+- SDLC pack fixes: the merge queue records what the forge reports, survives a locked tracking ref, a dev CI it could not check, an unreadable default branch and a failed `gh pr list`, parks a PR after two failed reads, takes answers on own PRs, rejoins a parked own PR after a push, no longer enrolls build-queue PRs as own PRs, refuses an ask that offers `return` where it cannot, and keeps `Refs` on a refused merge. The build queue starts a fresh round when a ruling supersedes the open PR, re-drafts a PR that changed while being marked ready, and implements on its own earlier PR and on a queue branch matching the PR head. Delivered PRs close their issues, review creates `review/` before it runs, review no longer blocks on a stale PR description, the CI node waits in the foreground, a transient forge error on a comment write is retried, and a build-owned PR without a brief pauses for an answer. (#4488, #4518, #4526, #4531, #4644, #4690, #4691, #4715, #4725, #4733, #4823, #4825, #4826, #4841, #4874, #4916, #4918, #4921, #4945, #4964, #5017, #5177)
+
 ## [0.12.1] - 2026-10-17
 
 Release binaries no longer hand a target repository's `.env` to providers.

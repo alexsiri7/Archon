@@ -1,6 +1,6 @@
 {
   "name": "@archon/plugin-manifest",
-  "version": "0.12.1",
+  "version": "0.14.0",
   "type": "module",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
@@ -20,10 +20,5 @@
   },
   "peerDependencies": {
     "typescript": "^5.0.0"
-  },
-  "testGroups": [
-    [
-      "src/"
-    ]
-  ]
+  }
 }

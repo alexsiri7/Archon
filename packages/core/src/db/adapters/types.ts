@@ -26,7 +26,9 @@ export interface IDatabase {
    * Execute a callback within a database transaction.
    * All queries using the provided function are atomic -
    * they either all commit or all roll back on error.
-   *
+   * `fn` may run more than once: after a lock conflict (SQLite busy, PostgreSQL deadlock
+   * or serialization failure) the adapter rolls back and reruns the whole callback, so
+   * it must have no effects outside the transaction.
    * @param fn - Callback receiving a transaction-scoped query function
    * @returns The callback's return value
    */
@@ -144,4 +146,11 @@ export interface SqlDialect {
    * @param table - Table or alias to lock when the SELECT joins others
    */
   rowLock(table?: string): string;
+
+  /**
+   * Clause after a FROM table that forces `index`: ` INDEXED BY <index>` on SQLite,
+   * empty on Postgres. SQLite has no statistics unless ANALYZE ran, so it prefers any
+   * index with an equality term over a partial index whose predicate the query repeats.
+   */
+  indexedBy(index: string): string;
 }

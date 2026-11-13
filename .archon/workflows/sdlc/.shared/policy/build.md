@@ -1,8 +1,8 @@
 # Build queue policy
 
-This is the SDLC pack's default policy for the build queue. A project replaces it whole
-with its own `.archon/sdlc/policy/build.md`, which may be nothing more than a pointer to
-documents the project already has.
+This is the SDLC pack's default policy for the build queue. A project adds to it with
+its own `.archon/sdlc/policy/build.md`: the queue reads this default first and the
+project's file after it, and where the two conflict, the project's line wins.
 
 The queue acts on its own when the case is clear, and asks a maintainer when it is not.
 
@@ -20,9 +20,15 @@ The queue acts on its own when the case is clear, and asks a maintainer when it 
     steering documents or the rulings already answer;
   - a stop that names as a blocker work a later step owns, such as a review, CI or a
     maintainer's merge (a false blocker).
+
+  Any round that would continue is first checked against the contract's shape. A
+  correction that adds machinery the contract does not name asks instead, naming the
+  subtractive option. A pull request that changed nothing material since its last
+  review, no commits or only cosmetic edits, never continues; the round ends as done or ask.
 - **Push** commits a run left committed but unpushed on its pull request's branch.
 - **Done** when the pull request's latest review says Ready at its head commit and CI
-  marked it ready.
+  marked it ready. When the only thing left is a check no round can run, such as an
+  operator check the review deferred, the queue asks once for it at that head instead.
 
 ## Unclear: the queue asks
 

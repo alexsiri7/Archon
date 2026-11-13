@@ -1,27 +1,46 @@
 import { readFileSync } from 'node:fs';
+import { dirname, join, normalize } from 'node:path';
 
 const DOCS_DIRECTORY = 'packages/docs-web/';
 const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
 
 /**
- * Paths that read as documentation but are build inputs, so changing one must run
- * the auxiliary build and service jobs. Markdown in bundled prompts and skills is
+ * Paths that read as documentation but are build or test inputs, so changing one must run
+ * the test suite and auxiliary build and service jobs. Markdown in bundled prompts and skills is
  * executable content rather than ordinary prose.
  *
  * An entry ending in `/` matches a directory, anything else matches one file. Each is here
  * because a named check reads it:
  *   - Pack prompts (`commands/`) and `.shared/` documents under `.archon/workflows/` are read
  *     by the bundle tests and embedded into the binary by `scripts/build-binaries.sh`
- *     (`serve-binary`); `isPackPrompt` matches them. Pack READMEs and design notes are prose.
+ *     (`serve-binary`); `isPackPrompt` matches them. Pack READMEs and design notes are prose
+ *     unless a test reads them.
  *     Every other file under `.archon/workflows/` is not Markdown, so it runs the suite anyway.
  *   - `.claude/skills/` is imported as text by `packages/cli/src/bundled-skill.ts`, so it is
  *     compiled into the CLI itself (CLI skill tests).
  *   - `provider-capabilities.md` is generated from the providers' `capabilities.ts`
  *     (`check:capability-matrix`), and lives under the docs site without being prose.
  *   - The docs manifest is copied by the Docker dependency layer.
+ *   - The SDLC README and variables reference contain Docker commands checked by
+ *     `docker-verification-label.test.ts` against the cleanup ownership label.
+ *   - Directory-qualified tracked Markdown paths named by tests are checked against this gate by
+ *     `markdownTestInputs` in `should-run-test-suite.test.ts`.
  */
 const BUILD_INPUTS = [
   '.claude/skills/',
+  '.archon/workflows/sdlc/README.md',
+  '.archon/architecture.md',
+  '.archon/workflow-language-constitution.md',
+  '.claude/commands/execute.md',
+  'packages/providers/src/codex/protocol/README.md',
+  'packages/docs-web/src/content/docs/reference/database.md',
+  'packages/docs-web/src/content/docs/reference/variables.md',
+  'packages/docs-web/src/content/docs/reference/api.md',
+  'packages/docs-web/src/content/docs/reference/node-execution.md',
+  'packages/docs-web/src/content/docs/deployment/docker.md',
+  'packages/docs-web/src/content/docs/deployment/reverse-proxy.md',
+  'packages/docs-web/src/content/docs/getting-started/operate.md',
+  'packages/docs-web/src/content/docs/guides/workflow-triggers.md',
   'packages/docs-web/src/content/docs/reference/provider-capabilities.md',
   'packages/docs-web/package.json',
 ];
@@ -37,17 +56,11 @@ const BUILD_INPUTS = [
  * `homebrew/archon.rb` (`build:checksums`), `scripts/install.ps1` (`test:install`), the web assets that feed the Docker image, and anything under
  * `.github/workflows/` — changing the gate must run the gate. `Caddyfile.example` is read by
  * `reverse-proxy.test.ts` and `caddy-recipe.test.ts`, and git applies `.gitattributes` to every
- * file a test reads from the checkout.
+ * file a test reads from the checkout. `.env.example` is read by `caddy-recipe.test.ts`.
  *
  * An entry ending in `/` matches a directory, anything else matches one file.
  */
-const INERT_PATHS = [
-  '.gitignore',
-  'LICENSE',
-  '.env.example',
-  '.archon/config.example.yaml',
-  'assets/',
-];
+const INERT_PATHS = ['.gitignore', 'LICENSE', '.archon/config.example.yaml', 'assets/'];
 
 const isInert = (file: string): boolean =>
   INERT_PATHS.some(entry => (entry.endsWith('/') ? file.startsWith(entry) : file === entry));
@@ -69,15 +82,180 @@ export function shouldRunTestSuite(files: Iterable<string>): boolean {
   return false;
 }
 
-export function shouldRunWorkflowFixtures(files: Iterable<string>): boolean {
-  for (const path of files) {
-    const file = path.replaceAll('\\', '/');
+const ROOT_SCRIPTS = 'scripts/';
+
+/** The files the workspace shards' CI step runs before any package test. */
+const WORKSPACE_RUNNER_ENTRY_POINTS = ['scripts/validate.ts', 'scripts/repo-tests.ts'];
+
+function trackedFiles(repo: string, ...paths: string[]): string[] {
+  const result = Bun.spawnSync(['git', 'ls-files', '-z', '--', ...paths], {
+    cwd: repo,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`Could not list tracked files: ${result.stderr.toString().trim()}`);
+  }
+  return result.stdout.toString().split('\0').filter(Boolean);
+}
+
+/**
+ * The root `scripts/` files a workspace package test can read, derived from the tree rather than
+ * listed, so a new reference cannot go stale. A candidate is an input when a tracked non-Markdown
+ * file under `packages/` names its path (a package `test` script, a test that spawns or reads a
+ * root script, or a comment: any mention counts, which keeps this conservative), when it is one
+ * of the workspace shards' entry points, or when an input statically imports it.
+ *
+ * Candidates are the tracked `scripts/` files plus `extraCandidates`, which the caller sets to
+ * the changed files: a deleted script some package still names must count, or deleting it would
+ * skip the very tests that would catch it.
+ */
+export function workspaceTestInputs(
+  repo: string,
+  extraCandidates: Iterable<string> = []
+): Set<string> {
+  const tracked = trackedFiles(repo, 'packages', 'scripts');
+  const candidates = rootScriptCandidates(tracked, extraCandidates);
+  const named = namedWorkspaceInputs(repo, tracked, candidates);
+  return withStaticImports(repo, tracked, candidates, [...named, ...WORKSPACE_RUNNER_ENTRY_POINTS]);
+}
+
+function rootScriptCandidates(
+  tracked: readonly string[],
+  extraCandidates: Iterable<string>
+): Set<string> {
+  return new Set([...tracked, ...extraCandidates].filter(file => file.startsWith(ROOT_SCRIPTS)));
+}
+
+/** `roots` plus every candidate they reach through relative static imports. */
+function withStaticImports(
+  repo: string,
+  tracked: readonly string[],
+  candidates: ReadonlySet<string>,
+  roots: Iterable<string>
+): Set<string> {
+  const inputs = new Set<string>();
+  const queue = [...roots];
+  const transpiler = new Bun.Transpiler({ loader: 'tsx' });
+  for (let file = queue.pop(); file !== undefined; file = queue.pop()) {
+    if (inputs.has(file)) continue;
+    inputs.add(file);
+    if (!/\.tsx?$/.test(file) || !tracked.includes(file)) continue;
+    const source = readFileSync(join(repo, file), 'utf8').replace(/^#!.*/, '');
+    for (const { path } of transpiler.scanImports(source)) {
+      if (!path.startsWith('.')) continue;
+      const target = ['', '.ts', '.tsx', '/index.ts']
+        .map(suffix => normalize(join(dirname(file), path + suffix)).replaceAll('\\', '/'))
+        .find(resolved => candidates.has(resolved));
+      if (target !== undefined) queue.push(target);
+    }
+  }
+  return inputs;
+}
+
+function namedWorkspaceInputs(
+  repo: string,
+  tracked: readonly string[],
+  candidates: ReadonlySet<string>
+): Set<string> {
+  const named = new Set<string>();
+  for (const file of tracked) {
+    if (!file.startsWith('packages/') || file.endsWith('.md') || file.endsWith('.mdx')) continue;
+    const source = readFileSync(join(repo, file), 'utf8');
+    for (const match of source.matchAll(/scripts\/[\w./-]+/g)) {
+      const path = match[0].replace(/\.+$/, '');
+      if (candidates.has(path)) named.add(path);
+    }
+  }
+
+  return named;
+}
+
+/**
+ * Whether the workspace shards (`@archon/cli` and every other package) must run. Only a root
+ * `scripts/` file that no workspace test reads can be left out; every other file the suite would
+ * run for still runs them:
+ *   - root tests read the packages (`scripts/test-inventory.test.ts` walks every package's tests,
+ *     `scripts/validate.ts` imports `@archon/paths`), so a package change never skips the scripts
+ *     shard, and that shard has no gate of its own beyond the suite's;
+ *   - `.archon/scripts/` is discovered by `packages/workflows` from the working directory, and a
+ *     workflows test dry-runs with this repository as that directory, so it is not provably
+ *     outside the package tests;
+ *   - `@archon/cli` and the other packages are not judged apart: packages launch
+ *     `packages/cli/src/cli.ts`, a coupling the manifests do not declare.
+ */
+export function shouldRunWorkspaceTests(
+  files: Iterable<string>,
+  inputs: ReadonlySet<string>
+): boolean {
+  for (const file of files) {
+    if (!shouldRunTestSuite([file])) continue;
+    if (file.startsWith(ROOT_SCRIPTS) && !inputs.has(file)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * What the pack shard (`.archon/scripts/` tests) and the workflow fixtures exercise, besides the
+ * root scripts that run them (`packRunnerInputs`). An entry ending in `/` matches a directory.
+ *   - The pack itself: its workflows, prompts, scripts and their tests, policy files, and the repo
+ *     config the fixtures load. `.archon/commands/` is absent: it holds only Markdown prompts for
+ *     workflows that have no fixtures, which the suite treats as prose.
+ *   - The contracts the pack is written against: `@archon/cli` (the `state`, `workflow` and
+ *     `forge` commands the pack shells to through `ARCHON_CLI_COMMAND`, which pack tests run for
+ *     real), `@archon/workflows` (the workflow language, the script-node environment, and the dry
+ *     run the fixtures use), `@archon/forge` (the plugin protocol behind `archon forge`), and
+ *     `@archon/paths` (where those commands and the test preload find the Archon home, config
+ *     and plugins). `@archon/core` stays out although `archon state` runs on it: it changes on
+ *     most pull requests, and its database and config behaviour is what its own tests guard.
+ *     The other packages below the contracts are likewise left to their own tests.
+ *   - The gate and the install: `test.yml`, the root manifest and the lockfile.
+ *   - The root test configuration, which `packRunnerInputs` cannot reach because it is loaded
+ *     by configuration, not imported: `bunfig.toml` and the preload it names.
+ */
+const PACK_INPUTS = [
+  '.archon/workflows/',
+  '.archon/scripts/',
+  '.archon/sdlc/',
+  '.archon/config.yaml',
+  'packages/cli/',
+  'packages/workflows/',
+  'packages/forge/',
+  'packages/paths/',
+  '.github/workflows/test.yml',
+  'package.json',
+  'bun.lock',
+  'bunfig.toml',
+  'scripts/test-preload.ts',
+];
+
+/** The root `scripts/` files that run the pack shard and the fixtures: the runner and its imports. */
+export function packRunnerInputs(
+  repo: string,
+  extraCandidates: Iterable<string> = []
+): Set<string> {
+  const tracked = trackedFiles(repo, 'scripts');
+  const candidates = rootScriptCandidates(tracked, extraCandidates);
+  return withStaticImports(repo, tracked, candidates, WORKSPACE_RUNNER_ENTRY_POINTS);
+}
+
+/**
+ * Whether the pack shard and the workflow fixtures must run. Only a file the suite runs for can
+ * count, so pack prose skips them, and a run that asks for them always has the job that holds them.
+ */
+export function shouldRunPackTests(
+  files: Iterable<string>,
+  runnerInputs: ReadonlySet<string>
+): boolean {
+  for (const file of files) {
+    if (!shouldRunTestSuite([file])) continue;
+    if (runnerInputs.has(file)) return true;
     if (
-      file.startsWith('.archon/workflows/sdlc/') ||
-      file.startsWith('packages/workflows/src/') ||
-      file === 'packages/cli/src/commands/workflow.ts'
-    )
+      PACK_INPUTS.some(entry => (entry.endsWith('/') ? file.startsWith(entry) : file === entry))
+    ) {
       return true;
+    }
   }
   return false;
 }
@@ -141,6 +319,7 @@ export interface EventPayload {
   before?: unknown;
   after?: unknown;
   pull_request?: { base?: { sha?: unknown }; head?: { sha?: unknown } } | null;
+  inputs?: Record<string, unknown> | null;
 }
 
 /** The commits to compare, or `null` when there is nothing to compare and the suite runs. */
@@ -162,9 +341,9 @@ function requireSha(value: unknown, field: string): string {
  * docs-only push cancel the run a code push had started (the workflow's concurrency group
  * cancels the older run) and then skip the suite, leaving the PR head untested.
  *
- * A push spans `before` to `after`. Its suite decision comes from `proofFromPullRequestRun`, and
- * only the fixture decision still reads the push diff. A push that creates a branch has an
- * all-zero `before`, so there is nothing to compare.
+ * A push spans `before` to `after`. Its decision comes from `proofFromPullRequestRun`, never
+ * from the push diff. A push that creates a branch has an all-zero `before`, so there is nothing
+ * to compare.
  */
 export function diffRange(eventName: string, event: EventPayload): DiffRange {
   if (eventName === 'workflow_dispatch') return null;
@@ -358,19 +537,69 @@ function githubApi(env: NodeJS.ProcessEnv = process.env): GitHubGet {
   };
 }
 
+const MODES = {
+  '--workspace-tests': 'workspace',
+  '--pack-tests': 'pack-tests',
+  '--pack-fixtures': 'pack-fixtures',
+} as const;
+export type Mode = 'suite' | (typeof MODES)[keyof typeof MODES];
+
+/** The pack modes, each named after the `test.yml` dispatch input that opts into it. */
+const OPT_IN_MODES: ReadonlySet<Mode> = new Set(['pack-tests', 'pack-fixtures']);
+
+/**
+ * A manual dispatch runs the suite, and the pack checks only when its input asks. The event file
+ * carries a boolean input as `true` or the string `"true"`; any other value but `false`, `"false"`
+ * or an absent input is a wiring bug, so it throws rather than publish a guess.
+ */
+export function dispatchDecision(mode: Mode, event: EventPayload): boolean {
+  if (!OPT_IN_MODES.has(mode)) return true;
+  const value = event.inputs?.[mode];
+  if (value === true || value === 'true') return true;
+  if (value === undefined || value === false || value === 'false') return false;
+  throw new Error(`The dispatch input ${mode} is ${JSON.stringify(value)}, not a boolean`);
+}
+
+function readMode(args: readonly string[]): Mode {
+  if (args.length === 0) return 'suite';
+  const mode =
+    args.length === 1 ? Object.entries(MODES).find(([flag]) => flag === args[0])?.[1] : undefined;
+  if (mode === undefined) {
+    throw new Error(
+      `Usage: bun scripts/should-run-test-suite.ts [${Object.keys(MODES).join(' | ')}]`
+    );
+  }
+  return mode;
+}
+
+const PREDICATES: Record<Mode, (files: Iterable<string>) => boolean> = {
+  suite: shouldRunTestSuite,
+  workspace: files => {
+    const changed = [...files];
+    return shouldRunWorkspaceTests(changed, workspaceTestInputs(process.cwd(), changed));
+  },
+  'pack-tests': packPredicate,
+  'pack-fixtures': packPredicate,
+};
+
+function packPredicate(files: Iterable<string>): boolean {
+  const changed = [...files];
+  return shouldRunPackTests(changed, packRunnerInputs(process.cwd(), changed));
+}
+
 /** Reads the event GitHub Actions names in `GITHUB_EVENT_NAME` and `GITHUB_EVENT_PATH`. */
 async function main(): Promise<void> {
-  const args = Bun.argv.slice(2);
-  if (args.length > 1 || (args.length === 1 && args[0] !== '--workflow-fixtures')) {
-    throw new Error('Usage: bun scripts/should-run-test-suite.ts [--workflow-fixtures]');
-  }
-  const fixtures = args.length === 1;
+  const mode = readMode(Bun.argv.slice(2));
   const eventName = process.env.GITHUB_EVENT_NAME;
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (!eventName || !eventPath) {
     throw new Error('GITHUB_EVENT_NAME and GITHUB_EVENT_PATH must both be set');
   }
   const event: EventPayload = JSON.parse(readFileSync(eventPath, 'utf8'));
+  if (eventName === 'workflow_dispatch') {
+    console.log(dispatchDecision(mode, event));
+    return;
+  }
   const range = diffRange(eventName, event);
   if (range === null) {
     console.log(true);
@@ -384,14 +613,11 @@ async function main(): Promise<void> {
       return;
     }
     console.error(`No pull request run proves this push: ${proof.reason}.`);
-    // A push is never path-filtered for the suite; only fixtures still follow the push diff.
-    if (!fixtures) {
-      console.log(true);
-      return;
-    }
+    // A push is never path-filtered.
+    console.log(true);
+    return;
   }
-  const predicate = fixtures ? shouldRunWorkflowFixtures : shouldRunTestSuite;
-  console.log(decideFromDiff(range.base, range.head, predicate));
+  console.log(decideFromDiff(range.base, range.head, PREDICATES[mode]));
 }
 
 if (import.meta.main) await main();

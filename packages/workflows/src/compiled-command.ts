@@ -1,6 +1,7 @@
 import type { BindingDirective, DagNode, IncludeDirective, TriggerRule } from './schemas';
 import { isIncludeDirective, isLoopGroupNode, isLoopNode } from './schemas';
 import { OUTPUT_REF_SOURCE, type JsonValue } from './output-ref';
+import type { WorkflowPack } from './schemas/pack-settings';
 
 /** Engine-private per-node metadata attached during load-time include expansion.
  * Symbols survive object spreads but stay out of YAML, JSON, API payloads, and
@@ -115,6 +116,8 @@ export const COMPOSED_NODE = Symbol('archon.composed-node');
  * Every descendant carries a copy because load-time expansion removes the include node.
  */
 interface ComposedBlockBoundaryBase {
+  /** Number of loop bodies crossed since this include was authored. */
+  loopDepth?: number;
   dependsOn: string[];
   entryTriggerRules: [TriggerRule, ...TriggerRule[]];
   when?: string;
@@ -150,9 +153,13 @@ export type ComposedBlockBoundary = ComposedBlockBoundaryBase &
  *    standalone.
  *  - `boundaries` — caller-level activation predicates for enclosing include instances,
  *    outermost first. Non-entry descendants enforce them before their local trigger rule.
+ *  - `pack` — the pack the authoring workflow was loaded from, which `$PACK_DIR` names.
+ *    Write-once like `origin`, and absent when that workflow is not in a pack: the
+ *    includer's pack is never this node's.
  */
 export interface ComposedNodeMeta {
   origin: string;
+  pack?: Pick<WorkflowPack, 'source' | 'key'>;
   inputs?: Record<string, JsonValue>;
   blockEntry?: true;
   boundaries?: ComposedBlockBoundary[];
@@ -204,6 +211,16 @@ function preserveEngineMetadata(
   const bindings = readComposedBindings(source);
   if (bindings !== undefined) attachComposedBindings(target, structuredClone(bindings));
   setIncludeOutputAliases(target, readIncludeOutputAliases(source));
+  preserveCompiledLoopCommand(source, target);
+  if (isLoopGroupNode(source) && isLoopGroupNode(target)) {
+    for (const [index, sourceChild] of source.loop_group.nodes.entries()) {
+      const targetChild = target.loop_group.nodes[index];
+      if (targetChild !== undefined) preserveEngineMetadata(sourceChild, targetChild);
+    }
+  }
+}
+
+function preserveCompiledLoopCommand(source: DagNode, target: DagNode): void {
   if (isLoopNode(source) && isLoopNode(target)) {
     const compiled = (source.loop as typeof source.loop & LoopWithCompiledCommand)[
       COMPILED_LOOP_COMMAND
@@ -211,12 +228,6 @@ function preserveEngineMetadata(
     if (compiled !== undefined) {
       (target.loop as typeof target.loop & LoopWithCompiledCommand)[COMPILED_LOOP_COMMAND] =
         structuredClone(compiled);
-    }
-  }
-  if (isLoopGroupNode(source) && isLoopGroupNode(target)) {
-    for (const [index, sourceChild] of source.loop_group.nodes.entries()) {
-      const targetChild = target.loop_group.nodes[index];
-      if (targetChild !== undefined) preserveEngineMetadata(sourceChild, targetChild);
     }
   }
 }

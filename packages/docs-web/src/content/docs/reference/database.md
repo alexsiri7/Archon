@@ -72,6 +72,9 @@ holder, fails the operation with `ProcessOwnerRecordError` naming its source; it
 read as a dead owner. `archon ai capacity` lists such a provider-attempt holder with the
 error, and `archon ai capacity release <attempt-id>` removes it. Each operation under the store lock removes `.lock-*` and
 `.probe-*` scratch files left by a crashed process once their owner is provably gone.
+New scratch names carry owner identity, allowing cleanup even when a crash leaves empty
+or torn contents. Older UUID-only scratch files still require readable owner contents;
+unreadable legacy residue stays and logs a warning on each locked operation.
 
 The intent and file synchronization protect against process crashes. Power-loss durability
 is limited by the platform's `fsync` guarantees; macOS does not force drive caches with
@@ -92,10 +95,10 @@ The server refuses file storage because its routes read SQL. Provider concurrenc
 Per-user GitHub identity (`GITHUB_APP_ID` with `TOKEN_ENCRYPTION_KEY`) fails at startup under
 file storage, because files hold no user tokens and a run would otherwise use the shared
 token. A GitHub App without `TOKEN_ENCRYPTION_KEY` works. Per-user provider credential
-mode does not prevent selecting file storage. Stored per-user provider credentials are refused during run preflight,
-before creating a worktree. Environment credentials and the provider's own login work
-normally. State documents (`archon state`) use the selected store. Files keep immutable
-JSON revisions under `state/<document-hash>/<revision>.json`, with a `name.json` record
+mode does not prevent selecting file storage. File-store runs never read or deliver stored
+per-user provider credentials. Preflight checks environment credentials and the provider's
+own login, including when the CLI supplies a user identity. State documents (`archon state`)
+use the selected store. Files keep immutable JSON revisions under `state/<document-hash>/<revision>.json`, with a `name.json` record
 containing the scope and name. Writes publish through the store-wide lock and recovery
 intent. `workflow cleanup` removes old revisions while keeping each document's latest
 revision, including tombstones. User and stored credential management still require
@@ -103,9 +106,9 @@ database storage.
 
 ## SQLite (Default - No Setup Required)
 
-With `store: database` (the default), **omit `DATABASE_URL`** from your `.env` file. The app will automatically:
+With `store: database` (the default), **leave `DATABASE_URL` unset** in your shell and Archon's environment files. The app will automatically:
 - Create a SQLite database at `~/.archon/archon.db`
-- Initialize the schema on first run
+- Initialize the schema on first run and skip startup writes when its completion proof is current
 - Use this database for operations with `store: database`
 
 **Pros:**
@@ -119,29 +122,52 @@ With `store: database` (the default), **omit `DATABASE_URL`** from your `.env` f
 
 Every Archon process on a machine shares one SQLite file, and SQLite lets one writer at a
 time hold its lock. When another process holds the lock past the 5-second busy timeout,
-Archon keeps waiting instead of failing: a single statement retries, and a transaction
-rolls back and reruns from the start, with a growing pause of up to 2 seconds between
+replayable operations keep waiting instead of failing: a single statement retries, and a
+transaction rolls back and reruns from the start, with a growing pause of up to 2 seconds between
 attempts. There is no deadline, so a run whose write is waiting stays alive until the lock
 clears. While it waits, Archon logs `db.sqlite_busy_waiting` at warn level every 30
 seconds. A repeating warning points at a process that is holding the lock. Other SQLite
-errors still fail right away.
+errors still fail right away. Schema convergence uses the same retry policy during
+synchronous database open (`operation: 'open'`); a needed upgrade waits for the writer
+before the constructor returns.
+
+Worktree cleanup first claims the registration with a short write that records the
+removing process in its metadata (`worktree_removal_owner`). Git and filesystem
+removal then run with no database transaction open. A second short write retires the
+registration after success, or releases the claim after a failure, leaving the
+registration active and the error reported. While a claim is held, a same-workflow
+registration, adoption, and a run start in that checkout are refused. A claim whose
+process has exited on this host is released by the next write that meets it; one from
+another host stays until an operator removes the key from the environment's metadata.
+
+Cleanup's claim holds registration exclusion through local checkout and branch removal.
+Completion and merged cleanup retain remote branches with a warning, including
+with force, because registration ownership cannot be proved after the claim
+commits. Enable GitHub's
+**Automatically delete head branches** setting for merged pull requests, or follow [manual remote branch recovery](/reference/cli/#recovering-remote-branch-cleanup).
 
 ## Remote PostgreSQL (Supabase, Neon, etc.)
 
-Set your remote connection string in `.env`:
+Set your remote connection string in `~/.archon/.env` for user-wide settings or `<cwd>/.archon/.env` for project overrides. A target repository's `<cwd>/.env` is stripped at startup. See [environment file locations and load order](/reference/configuration/#env-file-locations) for precedence and the source-server exception. For Docker, use the [Compose `.env` file](/deployment/docker/#configure-env).
 
 ```ini
 DATABASE_URL=postgresql://user:password@host:5432/dbname
 ```
 
-**No manual migration step is required.** On startup, the Postgres adapter applies the bundled `migrations/000_combined.sql` inside an advisory-lock transaction. The SQL is idempotent (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`), so both fresh installs and version upgrades converge automatically — including new tables and columns added in later releases.
+**No manual migration step is required.** On startup, the Postgres adapter applies the bundled `migrations/000_combined.sql` inside an advisory-lock transaction. The SQL is idempotent (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`), so both fresh installs and version upgrades converge automatically — including new tables and columns added in later releases. A process that finds the schema already current skips this step; see [Schema initialization and upgrades](#schema-initialization-and-upgrades).
+
+When PostgreSQL picks a statement or transaction as a deadlock victim or fails it for serialization (SQLSTATE `40P01` or `40001`), the adapter reruns it, up to four attempts in all, with a short growing pause between attempts, and logs `db.postgres_query_retry` or `db.postgres_transaction_retry` at warn level. A transaction reruns from its start. Other errors fail right away.
+
+Schema initialization is serialized rather than retried; the former
+`db.postgres_schema_init_retry` event is no longer emitted. A schema failure logs
+`db.postgres_schema_init_failed` and rejects operations waiting for initialization.
 
 Upgrades are verified, not assumed: CI applies the current schema on top of a database built from
 every distinct schema Archon has ever released, re-applies it to confirm idempotence, and compares
 the result against a fresh install — columns, indexes, column comments, constraints and sequences.
 Run the same check yourself against any PostgreSQL with `bun run check:schema-upgrades`.
 
-If schema application fails (permissions, syntax error, network), the process aborts at the first DB operation with the underlying Postgres error logged at `db.pg_schema_init_failed`.
+If schema application fails (permissions, syntax error, network), the process aborts at the first DB operation with the underlying Postgres error logged at `db.postgres_schema_init_failed`.
 
 ## Local PostgreSQL via Docker
 
@@ -197,7 +223,7 @@ The tables defined in `migrations/000_combined.sql` are prefixed with `remote_ag
 
 - **`remote_agent_workflow_runs`** - Workflow execution tracking
   - Tracks active workflows per conversation
-  - Locks concurrent execution per `working_path`: a second dispatch on a path with an active run (status `pending`/`running`/`paused`) is auto-cancelled with an actionable message. Stale `pending` rows older than 5 minutes are treated as orphaned and ignored. A `workflow:` sub-run shares its parent's checkout unless the node declares `isolation: worktree`, so the path-lock excludes both the run's ancestor chain and its descendants (via `parent_run_id`) — a child never contends with its own parent. Children of the same `fan_out` node share the checkout by design, so the lock also excludes them, their descendants, and the fan-out siblings of each ancestor; each such pair is recorded as `workflow.checkout_shared` events. Other runs on the path, including children of a different node, still contend.
+  - Guards concurrent execution per `working_path`: direct executor dispatch on a path with an active run (status `pending`/`running`/`paused`) is auto-cancelled with an actionable message. Workflows declaring `mutates_checkout: false` bypass this executor guard. [Trigger admission](/guides/workflow-triggers/#choose-a-resource-capacity-and-overlap-policy) queues or skips guarded starts on held paths according to `overlap`, including paths held by manual runs or other resources. Read-only starts may proceed beside foreign holders; same-resource checkout serialization still applies. Pending rows older than 5 minutes are ignored by the path guard without changing their lifecycle state. A `workflow:` sub-run shares its parent's checkout unless the node declares `isolation: worktree`, so the path-lock excludes both the run's ancestor chain and its descendants (via `parent_run_id`) — a child never contends with its own parent. Children of the same `fan_out` node share the checkout by design, so the lock also excludes them, their descendants, and the fan-out siblings of each ancestor; each such pair is recorded as `workflow.checkout_shared` events. Other runs on the path, including children of a different node, still contend.
   - Stores workflow state, step progress, and parent conversation linkage
   - Nullable `user_id` records which user triggered the run
   - Nullable `parent_run_id` (#2121 Phase 2) — self-referential FK (`ON DELETE SET NULL`) linking a `workflow:` sub-run to the run that spawned it; null for top-level runs. Makes the run tree walkable (`findChildRuns`/`getRunAncestry`) for the abandon cascade and cost roll-up.
@@ -211,6 +237,8 @@ The tables defined in `migrations/000_combined.sql` are prefixed with `remote_ag
   - Within one process, a run's standalone event writes (those not part of a larger transaction) go to the database one at a time, in the order they are issued, so they commit and read back in that order. Writes for the same run from two processes (for example the CLI and the server) are not ordered against each other
   - The dashboard event poller follows the store's commit-ordered event feed (`event_order`) across all runs. On PostgreSQL an `AFTER INSERT` trigger (`archon_workflow_event_notify`) calls `pg_notify('archon_dashboard_event', …)` so runs started out of process (the `archon` CLI / `--detach`) stream live to the console; on SQLite the poller picks them up within its interval. The trigger is Postgres-only and best-effort (a role without `CREATE TRIGGER` degrades to poll-only, not a boot failure).
   - A `BEFORE DELETE` trigger copies each deleted row into `remote_agent_workflow_event_archive`, which has the same columns and no run foreign keys, so cursors saved before a deletion can still read the payload. Schema apply adds any column the events table gains to the archive as well
+  - The partial index `idx_workflow_events_metrics` covers only `node_completed` rows whose `structured_output` has a `metrics` key, so [metric](/guides/metrics/) queries skip every other completion. Its predicate is textually the same as the metric records query's, which SQLite needs to use a partial index; SQLite also names it with `INDEXED BY`, because without `ANALYZE` statistics it prefers the `event_type` index
+  - `idx_workflow_events_run_type` on `(workflow_run_id, event_type)` serves reads of chosen event types for a list of runs, such as run listings and the steps a metrics report reads. It reads only the requested types of each run, skipping its high-volume `provider_event` rows, and gives SQLite a better choice than walking the `event_type` index across every run
 
 - **`remote_agent_workflow_event_sequence`** - Single-row high-water mark of committed `event_order` values; it never moves backwards when events or runs are deleted
 
@@ -229,7 +257,7 @@ The tables defined in `migrations/000_combined.sql` are prefixed with `remote_ag
   - One row per human (or bot) across all platforms
   - Created lazily on first sight by any chat/forge adapter
   - `display_name` and `email` are nullable until enrichment succeeds
-  - `role` (`VARCHAR`, default `'admin'`) stores `admin` or `member`. Archon explicitly writes `member` when creating a user. The database default stays `admin` for older binaries; upgrading preserves every existing user's role. Operators manage roles with [`archon user`](/reference/cli/#users-and-roles). Only a run's starter or an admin can act on it; see [Who can act on a run](/reference/security/#who-can-act-on-a-run). Existing multi-user installs remain unprotected until the operator demotes users who should not be admins
+  - `role` (`VARCHAR`, default `'admin'`) stores `admin` or `member`. Archon explicitly writes `member` when creating a user. The database default stays `admin` for older binaries; upgrading preserves every existing user's role. Operators manage roles with [`archon user`](/reference/cli/#user). Only a run's starter or an admin can act on it; see [Who can act on a run](/reference/security/#who-can-act-on-a-run). Existing multi-user installs remain unprotected until the operator demotes users who should not be admins
 
 - **`remote_agent_user_identities`** - Platform-to-Archon user mapping
   - One row per `(platform, platform_user_id)` pair — Slack U-id, Telegram chat id, Discord snowflake, GitHub login, the `web` Better Auth user id, etc.
@@ -265,9 +293,10 @@ The tables defined in `migrations/000_combined.sql` are prefixed with `remote_ag
   - One row per browser endpoint (`UNIQUE(endpoint)`), owned by the user who enabled it and cascaded on user deletion; only that owner can delete it
   - Stores the endpoint and its encryption keys; every row on the install receives notices, and the attention router removes rows the push service reports as expired (404/410)
 
-- **`remote_agent_schema_version`** - Diagnostic schema vintage
+- **`remote_agent_schema_version`** - Schema vintage and completion metadata
   - Records the Archon build that created the database and the build that last applied its schema
   - A single row (`id = 1`); databases predating this table retain an unknown creation version
+  - Nullable `schema_fingerprint` is separate, adapter-owned completion metadata. Each adapter publishes it only after successful convergence. Older writers can omit it
 
 - **`remote_agent_state_revisions`** - Durable project and install JSON documents and their audit history
   - Primary key: `(project_key, name, revision)`; optimistic writes append a revision
@@ -302,9 +331,40 @@ The tables defined in `migrations/000_combined.sql` are prefixed with `remote_ag
 ## Schema initialization and upgrades
 
 The PostgreSQL adapter applies `migrations/000_combined.sql` idempotently on startup
-for both fresh installs and upgrades. SQLite initializes and upgrades its schema
-in `packages/core/src/db/adapters/sqlite.ts`. Neither adapter uses a numbered
+for both fresh installs and upgrades, unless the database is already current. SQLite initializes its schema
+in `packages/core/src/db/adapters/sqlite.ts` and upgrades it in
+`packages/core/src/db/adapters/sqlite-migrations.ts`. Neither adapter uses a numbered
 migration runner or migration ledger.
+
+SQLite first checks its completion fingerprint in a read snapshot. It covers the schema
+DDL and migration steps a convergence executes (comments and layout excluded), the Archon
+build, and the SQLite schema counter; pending legacy credentials or
+a missing/behind event-sequence head also require repair. A current database opens without
+taking the writer lock. Otherwise, a single writer transaction rechecks, converges, and
+publishes the fingerprint atomically. Schema changes invalidate the proof; ordinary event
+inserts do not. Failed tolerated migrations leave no completion stamp and are retried on
+the next open. Diagnostic creation and applied-build vintages keep their existing meanings.
+
+PostgreSQL takes the schema advisory lock before reading its completion fingerprint. It covers
+the bundled schema SQL, the notify trigger, and the Archon build. The database is current when that
+fingerprint is recorded, the recorded applied build is this build (an older released build
+that converged since stamps its own version), no legacy provider ids remain, and the
+event-sequence head is not behind. A current database releases the lock without DDL.
+Waiting boots take no table locks before acquiring the advisory lock, then recheck the
+fingerprint, so only the first boot converges. When convergence is needed, the version table
+is locked exclusively before events DDL, preserving the version/events order of live readers.
+Core DDL, notify-trigger installation and
+fingerprint publication commit in one transaction. Missing tables or columns mean convergence
+is needed; other fingerprint-read errors abort initialization rather than trigger DDL.
+A role that cannot install the trigger keeps polling and converges on every start; a
+savepoint rolls back trigger installation and leaves the completion fingerprint unpublished.
+Only trigger-install permission errors use this polling fallback. Version-row writes,
+fingerprint writes (including a missing version row), and other trigger errors abort initialization.
+Source checkouts all record the applied build as `dev`, so a
+checkout that predates the PostgreSQL fingerprint can converge against the same database
+without invalidating a newer checkout's fingerprint, and the newer checkout keeps the older
+function bodies. To force convergence in that case, clear it:
+`UPDATE remote_agent_schema_version SET schema_fingerprint = NULL WHERE id = 1`.
 
 ### Workflow origin compatibility
 

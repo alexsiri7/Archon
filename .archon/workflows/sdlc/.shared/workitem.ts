@@ -11,17 +11,18 @@
  * next pickup; any other answer leaves it held, because a live owner and an orphan
  * cannot be told apart here.
  *
- * The build and merge queues claim the same documents through the same claim, so an
- * item has one owner at a time across the queues; their records are `facts.build`
- * (./build.ts) and `facts.merge` (./merge.ts).
+ * The build, merge and split queues claim the same documents through the same claim,
+ * so an item has one owner at a time across the queues; their records are
+ * `facts.build` (./build.ts), `facts.merge` (./merge.ts) and `facts.split`
+ * (./split.ts).
  */
 
 import { createHash } from 'node:crypto';
-import type { BuildRecord } from './build.ts';
+import { type BuildRecord, withReleasedRound } from './build.ts';
 import type { Closure } from './close.ts';
 import { record, type QualifiedPr } from './forge.ts';
 import type { MergeRecord } from './merge.ts';
-import { git, gitOrThrow } from './git.ts';
+import type { SplitRecord } from './split.ts';
 import { note } from './io.ts';
 import {
   type LabelVerdict,
@@ -32,14 +33,14 @@ import {
   type WorkType,
   wantedLabels,
 } from './labels.ts';
-import { fetchDefaultBranch } from './remote.ts';
 import {
-  claimDisposition,
-  runStatus,
+  claimEnded,
+  type Lease,
   stateAppend,
+  stateDocuments,
   stateGet,
-  stateList,
   statePut,
+  statePutClaimed,
 } from './state.ts';
 
 export type Stage = 'new' | 'needs_maintainer' | Route | 'needs_contract' | 'blocked' | 'close';
@@ -49,34 +50,6 @@ export type Trust = (typeof TRUSTS)[number];
 export const INTAKE_PATHS = ['quiet', 'closed', 'outside', 'triage'] as const;
 export const REQUEST_ACTIONS = ['opened', 'edited', 'reopened', 'added'] as const;
 export type RequestAction = (typeof REQUEST_ACTIONS)[number];
-/** The `mode` and `trust` inputs. No trust input is `maintainer`, so no input can raise trust. */
-export const INTAKE_MODES = ['live', 'eval'] as const;
-export type IntakeMode = (typeof INTAKE_MODES)[number];
-export const TRUST_INPUTS = ['auto', 'outside'] as const;
-export type TrustInput = (typeof TRUST_INPUTS)[number];
-
-function oneOf<const Values extends readonly string[]>(
-  name: string,
-  values: Values,
-  text: string
-): Values[number] {
-  const value = text.trim() === '' ? values[0] : text.trim();
-  if (!values.includes(value)) {
-    throw new Error(`${name} must be one of ${values.join(', ')}, not "${value}"`);
-  }
-  return value as Values[number];
-}
-
-/** The `mode` input; empty means `live`. */
-export function parseMode(text: string): IntakeMode {
-  return oneOf('mode', INTAKE_MODES, text);
-}
-
-/** The `trust` input; empty means `auto`. */
-export function parseTrustInput(text: string): TrustInput {
-  return oneOf('trust', TRUST_INPUTS, text);
-}
-
 /** One event intake has not yet processed. A label request carries who added the label. */
 export interface IntakeRequest {
   readonly at: string;
@@ -92,6 +65,11 @@ export interface Claim {
   readonly run_id: string;
   readonly at: string;
   readonly requests: readonly IntakeRequest[];
+  /**
+   * The branch a build round opens its pull request from, recorded once the round
+   * names it, so a release can find a pull request its run opened. No other claim has one.
+   */
+  readonly branch?: string;
 }
 
 export interface Promotion {
@@ -115,6 +93,8 @@ export interface TriageFacts {
   readonly complexity: Field<string>;
   readonly importance: Field<string>;
   readonly urgency: Field<string>;
+  /** Overlapping issues, earlier attempts and merged changes triage opened; absent on older items. */
+  readonly related?: readonly { readonly url: string; readonly relation: string }[];
   readonly at: string;
   readonly run_id: string;
 }
@@ -122,7 +102,7 @@ export interface TriageFacts {
 export interface HistoryEntry {
   readonly at: string;
   /** The queue whose pickup or decision wrote the entry. */
-  readonly stage: 'intake' | 'build' | 'merge';
+  readonly stage: 'intake' | 'build' | 'merge' | 'split';
   readonly run_id: string;
   readonly outcome: string;
   readonly summary: string;
@@ -154,6 +134,9 @@ export interface WorkItem {
     readonly triage?: TriageFacts;
     readonly build?: BuildRecord;
     readonly merge?: MergeRecord;
+    readonly split?: SplitRecord;
+    /** A maintainer's own pull request the merge queue enrolled; no build round made it. */
+    readonly own_pr?: { readonly url: string; readonly at: string };
   };
   readonly history: readonly HistoryEntry[];
 }
@@ -184,7 +167,6 @@ export interface TriageResult extends Omit<TriageFacts, 'at' | 'run_id'> {
   readonly report: { readonly run_id: string; readonly path: string };
 }
 
-export const MAINTAINERS_PATH = '.archon/sdlc/policy/maintainers.json';
 // History, run links and label requests are capped so a label-spamming account cannot
 // push the document past the state store's 64 KiB limit and wedge the item. `archon
 // state log` keeps every revision.
@@ -197,6 +179,7 @@ const STAGES = {
   plan: true,
   deliver: true,
   continue: true,
+  split: true,
   needs_contract: true,
   blocked: true,
   close: true,
@@ -210,7 +193,7 @@ export function bodyDigest(body: string): string {
   return `sha256:${createHash('sha256').update(body, 'utf8').digest('hex')}`;
 }
 
-function newest<T>(entries: readonly T[]): T[] {
+export function newest<T>(entries: readonly T[]): T[] {
   return entries.slice(-KEPT);
 }
 
@@ -290,31 +273,16 @@ export interface OrderKey {
   readonly direction: 'asc' | 'desc';
 }
 
-export const DEFAULT_ORDER = '["urgency desc","importance desc","size asc","created asc"]';
-
-/** The `order` input: a JSON array of `"<key> <asc|desc>"`. Anything else refuses. */
-export function parseOrder(text: string): OrderKey[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text.trim() === '' ? DEFAULT_ORDER : text);
-  } catch {
-    throw new Error('order is not a JSON array');
-  }
-  if (!Array.isArray(parsed)) throw new Error('order is not a JSON array');
-  return parsed.map(entry => {
-    const [key, direction, ...rest] = typeof entry === 'string' ? entry.split(' ') : [];
-    if (
-      rest.length > 0 ||
-      !(key === 'created' || Object.hasOwn(RANKS, key ?? '')) ||
-      (direction !== 'asc' && direction !== 'desc')
-    ) {
-      throw new Error(
-        `order entry ${JSON.stringify(entry)} is not "<urgency|importance|size|complexity|created> <asc|desc>"`
-      );
-    }
-    return { key: key as OrderKey['key'], direction };
-  });
-}
+/**
+ * The order every queue claims items in: most urgent, then most important, then
+ * smallest, then oldest.
+ */
+export const PICKUP_ORDER: readonly OrderKey[] = [
+  { key: 'urgency', direction: 'desc' },
+  { key: 'importance', direction: 'desc' },
+  { key: 'size', direction: 'asc' },
+  { key: 'created', direction: 'asc' },
+];
 
 function sortValue(doc: WorkItem, key: OrderKey['key']): number | string | undefined {
   if (key === 'created') return doc.created_at;
@@ -380,7 +348,15 @@ export function mirrorLabels(doc: WorkItem): PackLabel[] {
   if (doc.stage === 'needs_maintainer') return ['archon-needs-maintainer'];
   const triage = doc.facts.triage;
   if (doc.stage === 'new' || triage === undefined) return [];
-  return wantedLabels(triage.verdict, triage.type.value, triage.size.value);
+  // A re-triage after the split queue's record replaces what that record says here.
+  const split = doc.facts.split !== undefined && doc.facts.split.at >= triage.at ? doc.facts.split : undefined;
+  // An item the split queue handed back whole carries the route it now waits at.
+  const verdict: LabelVerdict =
+    split?.status === 'whole' ? { contract: 'READY', route: split.route } : triage.verdict;
+  const wanted = wantedLabels(verdict, triage.type.value, triage.size.value);
+  // A split PRD stays open, marked as one, until its hypothesis has a verdict.
+  if (doc.stage === 'split' && split?.status === 'done' && split.kind === 'prd') wanted.push('archon-prd');
+  return wanted;
 }
 
 function promotedAt(promoted: Promotion | null, digest: string): boolean {
@@ -407,7 +383,7 @@ export function assertNoSelfPromotion(doc: WorkItem, add: readonly string[]): vo
 // --- the decision ---------------------------------------------------------------
 
 export interface IssueFacts {
-  /** Undefined when the selected source does not report authors. */
+  /** Undefined when the forge plugin does not report authors. */
   readonly author: string | null | undefined;
   readonly labels: readonly string[];
   readonly state: 'open' | 'closed';
@@ -421,18 +397,13 @@ export function isMaintainer(login: string | null, maintainers: ReadonlySet<stri
 /**
  * Decide what the claimed item needs, from the document, its claimed requests and
  * the live issue. Pure: the outcome node applies the result.
- *
- * `trustInput: 'outside'` decides an item with no recorded trust as outside without
- * reading its author. It never rewrites recorded trust, so it refuses an item already
- * recorded as a maintainer's. Label actors are still checked against the real list.
  */
 export function decideIntake(
   doc: WorkItem,
   issue: IssueFacts,
   maintainers: ReadonlySet<string>,
   at: string,
-  runId: string,
-  trustInput: TrustInput = 'auto'
+  runId: string
 ): IntakeDecision {
   let trust = doc.trust;
   let promoted = doc.promoted;
@@ -468,17 +439,10 @@ export function decideIntake(
     noted('closed', 'the issue is closed; intake changes nothing on it');
     return { ...quiet(), path: 'closed' };
   }
-  if (trustInput === 'outside' && trust === 'maintainer') {
-    throw new Error(
-      "trust: outside cannot lower trust this item already recorded as maintainer; a work item's trust is decided once"
-    );
-  }
-  if (trust === null && trustInput === 'outside') {
-    trust = 'outside';
-  } else if (trust === null) {
+  if (trust === null) {
     if (issue.author === undefined) {
       throw new Error(
-        'the selected forge source does not report issue authors, so trust cannot be decided'
+        'the forge plugin does not report issue authors, so trust cannot be decided'
       );
     }
     trust = isMaintainer(issue.author, maintainers) ? 'maintainer' : 'outside';
@@ -571,22 +535,9 @@ export function applyDecision(
   };
   if (decision.path === 'triage') {
     if (triage === null) throw new Error('the triage path has no triage verdict');
-    const { verdict, pull_request, type, size, complexity, importance, urgency, summary, report } =
-      triage;
-    facts = {
-      ...facts,
-      triage: {
-        verdict,
-        pull_request,
-        type,
-        size,
-        complexity,
-        importance,
-        urgency,
-        at,
-        run_id: runId,
-      },
-    };
+    // The stored facts are the verdict minus what only this run's outcome reads.
+    const { closure: _closure, labels: _labels, summary, report, ...kept } = triage;
+    facts = { ...facts, triage: { ...kept, at, run_id: runId } };
     if (bodyMoved) {
       stage = 'needs_maintainer';
       promoted = null;
@@ -630,36 +581,6 @@ export function applyDecision(
   };
 }
 
-// --- the maintainer list ------------------------------------------------------------
-
-/** The maintainer list's text, lower-cased logins; anything but an array of logins refuses. */
-export function parseMaintainers(text: string): Set<string> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error(`${MAINTAINERS_PATH} is not valid JSON`);
-  }
-  if (
-    !Array.isArray(parsed) ||
-    !parsed.every(login => typeof login === 'string' && login.trim() !== '')
-  ) {
-    throw new Error(`${MAINTAINERS_PATH} must be a JSON array of forge logins`);
-  }
-  return new Set(parsed.map(login => (login as string).trim().toLowerCase()));
-}
-
-/**
- * The maintainer list at the head of the repository's default branch, read with git
- * so it works on either forge source and whatever branch the checkout sits on. No
- * file means nobody: every author is outside.
- */
-export function readMaintainers(repo: QualifiedPr['repo']): Set<string> {
-  const { ref } = fetchDefaultBranch(repo);
-  if (git('cat-file', '-e', `${ref}:${MAINTAINERS_PATH}`).code !== 0) return new Set();
-  return parseMaintainers(gitOrThrow('show', `${ref}:${MAINTAINERS_PATH}`));
-}
-
 // --- pickup ---------------------------------------------------------------------
 
 /**
@@ -687,13 +608,13 @@ export interface Read {
   readonly name: string;
   readonly revision: number;
   readonly doc: WorkItem;
+  readonly lease: Lease | null;
 }
 
-function read(name: string): Read | undefined {
-  const stored = stateGet(name);
+export function read(name: string, stored = stateGet(name)): Read | undefined {
   if (stored.value === null) return undefined;
   try {
-    return { name, revision: stored.revision, doc: parseWorkItem(stored.value) };
+    return { name, revision: stored.revision, doc: parseWorkItem(stored.value), lease: stored.lease };
   } catch (error) {
     note(`pickup skips ${name}: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
@@ -721,25 +642,23 @@ export function readWorkItem(number: number): WorkItem | null {
 }
 
 /**
- * Release a claim whose run the engine reports terminal; any other answer holds it.
- * A run that finishes clears its own claim, so a terminal run still holding one
- * stopped before its labels were written, and its requests wait again.
+ * Release a claim whose run's lease the engine reports ended; any other claim holds. A
+ * run that finishes clears its own claim, so an ended run still holding one stopped
+ * before its labels were written, and its requests wait again. A build round that
+ * opened a pull request before it stopped is recorded as a round.
  */
-function releaseIfTerminal(item: Read, at: string, runId: string, pickup: Pickup): Read {
+export function releaseIfTerminal(item: Read, at: string, runId: string, pickup: Pickup): Read {
   const claim = item.doc.claim;
   // A pickup that claims several items sees its own claims on its next pass.
   if (claim === null || claim.run_id === runId) return item;
-  const status = runStatus(claim.run_id);
-  if (claimDisposition(status) === 'hold') {
-    if (status === null) {
-      note(
-        `${pickup.stage} leaves ${item.name} claimed: the engine reports no status for run ${claim.run_id}`
-      );
+  if (!claimEnded(claim.run_id, item)) {
+    if (item.lease?.runId !== claim.run_id) {
+      note(`${pickup.stage} leaves ${item.name} claimed: run ${claim.run_id} holds no engine lease on it`);
     }
     return item;
   }
   const doc: WorkItem = {
-    ...item.doc,
+    ...withReleasedRound(item.doc, claim, at),
     claim: null,
     requests: queued([...claim.requests, ...item.doc.requests]),
     history: newest([
@@ -749,12 +668,12 @@ function releaseIfTerminal(item: Read, at: string, runId: string, pickup: Pickup
         stage: pickup.stage,
         run_id: runId,
         outcome: 'released',
-        summary: `released the claim of run ${claim.run_id}, which ended ${String(status)} without finishing its outcome; its requests wait again`,
+        summary: `released the claim of run ${claim.run_id}, which ended without finishing its outcome; its requests wait again`,
       },
     ]),
   };
-  return statePut(item.name, doc, item.revision) === 'ok'
-    ? { ...item, revision: item.revision + 1, doc }
+  return statePut(item.name, doc, item.revision, 'release') === 'ok'
+    ? { ...item, revision: item.revision + 1, doc, lease: null }
     : item;
 }
 
@@ -785,27 +704,27 @@ function claimed(item: Read, at: string, runId: string, pickup: Pickup): WorkIte
   };
 }
 
-function claimable(item: Read | undefined, pickup: Pickup): item is Read {
+export function claimable(item: Read | undefined, pickup: Pickup): item is Read {
   return item !== undefined && item.doc.claim === null && pickup.waits(item.doc);
 }
 
 /**
- * Release terminal claims, then claim the first waiting item in `order` with a
- * conditional write. A conflict re-reads the item once and claims it only if it
- * still waits unclaimed; otherwise the next candidate is tried.
+ * Read every work item in one state call, release terminal claims, then claim the
+ * first waiting item in `PICKUP_ORDER` with a conditional write. A conflict re-reads the
+ * item once and claims it only if it still waits unclaimed; otherwise the next
+ * candidate is tried.
  */
 export function claimNext(
-  order: readonly OrderKey[],
   at: string,
   runId: string,
   pickup: Pickup = INTAKE_PICKUP
 ): WorkItem | null {
-  const items = stateList('work/')
-    .map(read)
+  const items = stateDocuments('work/')
+    .map(stored => read(stored.name, stored))
     .filter((item): item is Read => item !== undefined)
     .map(item => releaseIfTerminal(item, at, runId, pickup));
   const waiting = items.filter((item): item is Read => claimable(item, pickup));
-  for (const candidate of sortCandidates(waiting, order)) {
+  for (const candidate of sortCandidates(waiting, PICKUP_ORDER)) {
     const won = claimItem(candidate, at, runId, pickup);
     if (won !== null) return won;
   }
@@ -819,17 +738,37 @@ export function claimItem(
   pickup: Pickup = INTAKE_PICKUP
 ): WorkItem | null {
   const doc = claimed(candidate, at, runId, pickup);
-  if (statePut(candidate.name, doc, candidate.revision) === 'ok') return doc;
+  if (statePut(candidate.name, doc, candidate.revision, 'take') === 'ok') return doc;
   const fresh = read(candidate.name);
   if (!claimable(fresh, pickup)) return null;
   const retried = claimed(fresh, at, runId, pickup);
-  return statePut(fresh.name, retried, fresh.revision) === 'ok' ? retried : null;
+  return statePut(fresh.name, retried, fresh.revision, 'take') === 'ok' ? retried : null;
+}
+
+/**
+ * Claim the named item for a queue, releasing a terminal claim on it first as
+ * `claimNext` does. Refuses with the facts an operator acts on when it cannot.
+ */
+export function claimNamed(number: number, at: string, runId: string, pickup: Pickup): WorkItem {
+  const issue = `issue ${String(number)}`;
+  const found = read(workItemName(number));
+  if (found === undefined) throw new Error(`${issue} has no work item: intake has not recorded it`);
+  const item = releaseIfTerminal(found, at, runId, pickup);
+  const won = claimable(item, pickup) ? claimItem(item, at, runId, pickup) : null;
+  if (won !== null) return won;
+  const now = read(item.name) ?? item;
+  if (now.doc.claim !== null) throw new Error(`${issue} is claimed by run ${now.doc.claim.run_id}`);
+  // Both conditional writes can lose to concurrent writes that leave the item waiting.
+  if (pickup.waits(now.doc)) throw new Error(`${issue} kept changing while this run claimed it; launch it again`);
+  const record = now.doc.facts[pickup.stage];
+  const status = record !== undefined && 'status' in record ? `, ${pickup.stage} status ${record.status}` : '';
+  throw new Error(`${issue} does not wait for the ${pickup.stage} queue: stage ${now.doc.stage}${status}`);
 }
 
 /**
  * Replace the document of the item this run holds, re-reading on a conflict. Refuses
- * when the claim is no longer this run's, for example after a failed run's claim was
- * released and the run was then resumed.
+ * when the claim is no longer this run's. A change that clears the claim gives back the
+ * run's lease in the same write.
  */
 export function updateClaimed(
   subject: QualifiedPr,
@@ -844,7 +783,7 @@ export function updateClaimed(
     if (doc.claim?.run_id !== runId) throw new Error(`${name} is no longer claimed by this run`);
     const changed = change(doc);
     const next = { ...changed, requests: queued(changed.requests) };
-    if (statePut(name, next, stored.revision) === 'ok') return next;
+    if (statePutClaimed(name, next, stored.revision) === 'ok') return next;
   }
   throw new Error(`${name} kept changing: three conditional writes conflicted`);
 }

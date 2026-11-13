@@ -2,10 +2,10 @@
  * Publish the review report as the pull request's one canonical comment.
  *
  * The reviewer judges and writes the report; this node owns the public write, so
- * every round edits the same marked comment instead of appending another. A
- * review whose scope was a working diff has no pull request and publishes
- * nothing. The verdict passes through unchanged either way: publication is not
- * what makes a review true.
+ * every round edits the same marked comment instead of appending another. A review
+ * whose scope was a working diff has no pull request and publishes nothing. The
+ * verdict passes through unchanged either way: publication is not what makes a
+ * review true.
  *
  * A report goes public only about the commit its round fixed at the start
  * (review-round): the checkout must still be at it and the pull request's remote
@@ -34,7 +34,6 @@ import { dirname, join } from 'node:path';
 import { nodeStartCommit } from '../../.shared/checkout.ts';
 import { upsertComment, viewPr } from '../../.shared/pr.ts';
 import {
-  forgeSource,
   parseQualifiedPr,
   record,
   sameRepo,
@@ -70,7 +69,6 @@ function label(pr: QualifiedPr | undefined): string {
 }
 
 try {
-  const source = forgeSource();
   const verdict = {
     ready: JSON.parse(text(process.env.INPUTS_READY)) as boolean,
     action: text(process.env.INPUTS_ACTION),
@@ -79,6 +77,8 @@ try {
     discoveries: JSON.parse(text(process.env.INPUTS_DISCOVERIES)) as unknown,
     contract_left: JSON.parse(text(process.env.INPUTS_CONTRACT_LEFT)) as unknown,
   };
+  // Complete only on an empty list: a review that left anything open never lets a merge close the issue.
+  const coverage = Array.isArray(verdict.contract_left) && verdict.contract_left.length === 0 ? 'complete' : 'open';
   const recorded = recordedPr(text(process.env.INPUTS_SCOPE));
   const declared = declaredPr(text(process.env.INPUTS_PR));
   const pr = recorded ?? declared;
@@ -91,7 +91,7 @@ try {
     throw new Error(`this round reviewed ${head}, but the checkout is now at ${checkout}`);
   }
   if (pr) {
-    const remote = viewPr(pr, source).pr.head_revision;
+    const remote = viewPr(pr).pr.head_revision;
     if (remote !== head) {
       throw new Error(
         `this round reviewed ${head}, but ${label(pr)} is at ${remote ?? 'an unknown head'}: the commits under review were not pushed`
@@ -112,8 +112,7 @@ try {
     const comment = upsertComment(
       { kind: 'pr', ref: pr },
       REVIEW_MARKER,
-      reviewCommentBody(head, verdict.ready, report),
-      source
+      reviewCommentBody(head, verdict.ready, coverage, report)
     );
     note(`publish-review: canonical review comment at ${comment.url}`);
   }

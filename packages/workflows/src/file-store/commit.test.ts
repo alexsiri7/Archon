@@ -341,7 +341,8 @@ test.each([...stateCrashSteps])('state redo preserves immutable files after %s',
   const revision = `${dir}/2.json`;
   const obsolete = `${dir}/1.json`;
   await mkdir(join(root, dir), { recursive: true });
-  const row: StateRevision = {
+  // A revision file as written before leases existed.
+  const row: Omit<StateRevision, 'lease'> = {
     name: 'ledger',
     revision: 2,
     value: null,
@@ -386,7 +387,9 @@ test.each([...stateCrashSteps])('state redo preserves immutable files after %s',
   if (stateCrashSteps.indexOf(step) >= 5)
     await writeFile(join(root, 'head.json'), JSON.stringify({ format: 1, seq }));
   expect(await store.getStateDocument({ kind: 'install' }, 'ledger')).toBeNull();
-  expect(await store.listStateRevisions({ kind: 'install' }, 'ledger')).toEqual([row]);
+  expect(await store.listStateRevisions({ kind: 'install' }, 'ledger')).toEqual([
+    { ...row, lease: null },
+  ]);
   expect(await readFile(join(root, revision), 'utf8')).toBe(JSON.stringify(row));
   expect(await Bun.file(join(root, obsolete)).exists()).toBe(false);
   if (inode !== undefined) expect((await stat(join(root, revision))).ino).toBe(inode);
@@ -412,4 +415,20 @@ test('immutable publication rejects different bytes and retains the recovery int
   ).rejects.toThrow('Immutable store document differs');
   expect(await readFile(join(root, 'state/test/1.json'))).toEqual(before);
   expect(await Bun.file(join(root, 'intent.json')).exists()).toBe(true);
+});
+
+test('cancellation retains structured cleanup warnings across reopen', async () => {
+  const { root, store, run } = await fixture();
+  const warnings = ['Output still held; use lsof on the checkout.'];
+  await store.cancelWorkflowRun(run.id, {
+    cancel_reason: 'operator',
+    reason: warnings[0],
+    warnings,
+  });
+  const reopened = await createFileWorkflowStore({ root });
+  const events = await reopened.listWorkflowEvents(run.id);
+  expect(events.find(event => event.event_type === 'workflow_cancelled')?.data).toMatchObject({
+    reason: warnings[0],
+    warnings,
+  });
 });

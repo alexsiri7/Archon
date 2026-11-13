@@ -25,7 +25,7 @@ const mockUpdateConversationTitle = mock(async (_id: string, _title: string) => 
 
 import { generateAndSetTitle } from '../../../core/src/services/title-generator';
 import { generateTitleForUser } from '../../../core/src/services/user-title-generator';
-import { resolveTitleRequest } from '../../../core/src/orchestrator/orchestrator-agent';
+import { resolveTitleRequest } from '../../../core/src/orchestrator/chat-request';
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
   getDatabaseType: () => 'sqlite',
@@ -91,7 +91,11 @@ mock.module('@archon/core/db/conversations', () => ({
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({}));
-mock.module('@archon/core/db/workflows', () => ({}));
+mock.module('@archon/core/db/workflows', () => ({
+  getRunIdsByIsolationEnvId: mock(async (): Promise<string[]> => []),
+  getWorkflowRunsByIds: mock(async () => []),
+  getWorkflowRunForAttention: mock(async () => null),
+}));
 mock.module('@archon/core/db/workflow-events', () => ({}));
 const mockAddMessage = mock(async (_convId: string, _role: string, _content: string) => ({
   id: 'msg-uuid-1',

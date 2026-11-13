@@ -11,7 +11,7 @@
  * only when the run was launched with publish=true and the target is a tracker
  * issue does this verify the item's identity on the tracker, apply the labels, and
  * read them back. Area labels are never created: the prompt may only pick labels
- * the repository already has. Publishing uses the selected forge source.
+ * the repository already has. Publishing goes through the forge plugin.
  */
 
 import type { Closure } from '../../.shared/close.ts';
@@ -62,6 +62,18 @@ type Decision =
   | { contract: 'BLOCKED'; blocked_reason: string; blocked_by: string[] }
   | { contract: 'NO_ACTION'; closure: Closure };
 
+/** Every link a verdict carries is one the agent opened, so each must be a qualified URL. */
+function unqualifiedLink(
+  blockedBy: readonly string[],
+  related: readonly { url: string }[],
+  closure: Closure | null
+): string | null {
+  if (!blockedBy.every(isQualifiedUrl)) return 'blocked_by must be a list of fully qualified http(s) URLs';
+  if (!related.every(entry => isQualifiedUrl(entry.url))) return 'related urls must be fully qualified http(s) URLs';
+  if (closure !== null && !isQualifiedUrl(closure.url)) return 'closure.url must be a fully qualified http(s) URL';
+  return null;
+}
+
 function main(): void {
   const decision = bound(process.env.INPUTS_DECISION) as Decision;
   const contract: Contract = decision.contract;
@@ -80,6 +92,7 @@ function main(): void {
   const publish = text(process.env.INPUTS_PUBLISH) === 'true';
   const summary = text(process.env.INPUTS_SUMMARY);
   const area = bound(process.env.INPUTS_AREA_LABELS) as string[];
+  const related = bound(process.env.INPUTS_RELATED) as { url: string; relation: string }[];
   const boundItem = record(bound(process.env.INPUTS_ITEM));
   const repo = record(boundItem?.repo);
   if (
@@ -107,12 +120,9 @@ function main(): void {
     refuse(`invalid triage verdict: ${message}`);
   };
 
-  if (!blockedBy.every(isQualifiedUrl)) {
-    invalid('blocked_by must be a list of fully qualified http(s) URLs');
-    return;
-  }
-  if (closure !== null && !isQualifiedUrl(closure.url)) {
-    invalid('closure.url must be a fully qualified http(s) URL');
+  const badLink = unqualifiedLink(blockedBy, related, closure);
+  if (badLink !== null) {
+    invalid(badLink);
     return;
   }
   if (trimmed(summary) === '') {
@@ -157,6 +167,7 @@ function main(): void {
     blocked_reason: blockedReason,
     blocked_by: blockedBy,
     closure,
+    related,
     summary,
     report,
   });

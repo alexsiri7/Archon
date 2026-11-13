@@ -61,57 +61,36 @@ export function RecentRunRow({
 
   // Design v2 row grid: status | body | (project) | id | duration | cost | CLI.
   const gridCols = showProject
-    ? 'grid-cols-[220px_minmax(0,1fr)_140px_84px_70px_64px_auto]'
-    : 'grid-cols-[220px_minmax(0,1fr)_84px_70px_64px_auto]';
+    ? 'grid-cols-[220px_minmax(0,1fr)_140px_84px_70px_auto_auto]'
+    : 'grid-cols-[220px_minmax(0,1fr)_84px_70px_auto_auto]';
 
-  return (
-    <div
-      data-run-id={run.id}
-      onClick={onClick}
-      role={canOpen ? 'button' : undefined}
-      tabIndex={canOpen ? 0 : undefined}
-      onKeyDown={
-        canOpen
-          ? (event): void => {
-              if (
-                event.target === event.currentTarget &&
-                (event.key === 'Enter' || event.key === ' ')
-              ) {
-                event.preventDefault();
-                onClick();
-              }
-            }
-          : undefined
-      }
-      className={`group grid items-center gap-[18px] border-b border-border/40 px-[18px] py-[13px] transition-colors last:border-b-0 hover:bg-surface-hover ${gridCols} ${
-        selected ? 'bg-surface-hover ring-2 ring-inset ring-accent-bright/40' : ''
-      } ${canOpen ? 'cursor-pointer' : ''}`}
-    >
-      {/* status: dot/glyph + label */}
-      <span className="flex items-center gap-[9px]">
-        {run.status === 'failed' ? (
-          <span aria-hidden className={`text-[12px] leading-none ${statusTextClass.failed}`}>
-            {glyph}
-          </span>
-        ) : (
-          <span
-            aria-hidden
-            className={`h-2 w-2 shrink-0 rounded-full ${
-              run.status === 'completed'
-                ? 'bg-success shadow-[0_0_0_3px_color-mix(in_oklch,var(--success),transparent_85%)]'
-                : 'bg-text-tertiary'
-            }`}
-          />
-        )}
-        <span
-          className={`font-mono text-[11px] font-semibold uppercase tracking-[0.05em] ${statusTextClass[run.status]}`}
-        >
-          {run.status}
+  const renderStatus = (): ReactElement => (
+    <span className="flex items-center gap-[9px]">
+      {run.status === 'failed' ? (
+        <span aria-hidden className={`text-[12px] leading-none ${statusTextClass.failed}`}>
+          {glyph}
         </span>
-        <RunOutcomeBadge outcome={run.outcome} />
+      ) : (
+        <span
+          aria-hidden
+          className={`h-2 w-2 shrink-0 rounded-full ${
+            run.status === 'completed'
+              ? 'bg-success shadow-[0_0_0_3px_color-mix(in_oklch,var(--success),transparent_85%)]'
+              : 'bg-text-tertiary'
+          }`}
+        />
+      )}
+      <span
+        className={`font-mono text-[11px] font-semibold uppercase tracking-[0.05em] ${statusTextClass[run.status]}`}
+      >
+        {run.status}
       </span>
+      <RunOutcomeBadge outcome={run.outcome} />
+    </span>
+  );
 
-      {/* body: mono workflow name + muted description */}
+  const renderRunSummary = (): ReactElement => (
+    <>
       <span className="flex min-w-0 items-baseline gap-2.5">
         <span className="shrink-0 truncate font-mono text-[13px] font-bold text-text-primary">
           {run.workflow}
@@ -146,10 +125,41 @@ export function RecentRunRow({
       </span>
       <span
         className="text-right font-mono text-[12px] tabular-nums text-text-primary"
-        title={typeof run.costUsd === 'number' ? 'Total agent cost' : undefined}
+        title={typeof run.costUsd === 'number' ? 'Reported agent cost; may be partial' : undefined}
       >
-        {typeof run.costUsd === 'number' ? formatCost(run.costUsd) : ''}
+        {typeof run.costUsd === 'number'
+          ? `Reported cost ${formatCost(run.costUsd)} (may be partial)`
+          : ''}
       </span>
+    </>
+  );
+
+  return (
+    <div
+      data-run-id={run.id}
+      onClick={onClick}
+      role={canOpen ? 'button' : undefined}
+      tabIndex={canOpen ? 0 : undefined}
+      onKeyDown={
+        canOpen
+          ? (event): void => {
+              if (
+                event.target === event.currentTarget &&
+                (event.key === 'Enter' || event.key === ' ')
+              ) {
+                event.preventDefault();
+                onClick();
+              }
+            }
+          : undefined
+      }
+      className={`group grid items-center gap-[18px] border-b border-border/40 px-[18px] py-[13px] transition-colors last:border-b-0 hover:bg-surface-hover ${gridCols} ${
+        selected ? 'bg-surface-hover ring-2 ring-inset ring-accent-bright/40' : ''
+      } ${canOpen ? 'cursor-pointer' : ''}`}
+    >
+      {renderStatus()}
+
+      {renderRunSummary()}
 
       {/* trailing: origin + hover actions + CLI */}
       <span className="flex items-center justify-end gap-1.5">

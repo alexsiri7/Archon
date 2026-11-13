@@ -12,6 +12,10 @@ import { WorktreeProvider } from '@archon/isolation';
 import { getDefaultBranch, syncWorkspace, toRepoPath, toBranchName } from '@archon/git';
 import { SqliteAdapter, sqliteDialect } from '../db/adapters/sqlite';
 
+import { stubVerificationImageRelease } from '../test/stub-verification-image-release';
+
+stubVerificationImageRelease();
+
 const root = await realpath(await mkdtemp(join(tmpdir(), 'archon-base-branch-')));
 const dbPath = join(root, 'upgrade.sqlite');
 const vintage = new Database(dbPath);
@@ -304,4 +308,39 @@ test('the exported inspection seam rejects an ambiguous source before inspecting
   const ambiguous = { url: 'https://example.com/repo', path: root };
   // @ts-expect-error Both sources violate the exported exclusive source contract.
   await expect(inspectProjectBaseBranch(ambiguous)).rejects.toThrow('Provide either');
+});
+
+test('a repo owned by another user registers as a repo; a plain directory gets no trust', async () => {
+  const { detectProjectKind } = await import('../services/project-kind');
+  const checkout = join(root, 'foreign-owned');
+  const plain = join(root, 'foreign-plain');
+  await mkdir(checkout);
+  await mkdir(plain);
+  git(checkout, 'init', '-q');
+  git(checkout, 'commit', '--allow-empty', '-qm', 'init');
+  const grants = (): string => {
+    try {
+      return git(root, 'config', '--global', '--get-all', 'safe.directory');
+    } catch {
+      return '';
+    }
+  };
+  process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = '1';
+  // CI runner images trust every path in the system config (safe.directory = *).
+  process.env.GIT_CONFIG_NOSYSTEM = '1';
+  // Earlier tests' worktrees already granted safe.directory entries in the shared global config on Windows.
+  const sharedGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+  process.env.GIT_CONFIG_GLOBAL = join(root, 'foreign-owned.gitconfig');
+  try {
+    // The Settings → Projects route classifies the path, then registers it.
+    expect(await detectProjectKind(checkout)).toBe('repo');
+    const result = await registerRepository(checkout);
+    expect((await getCodebase(result.codebaseId))?.kind).toBe('repo');
+    expect(await detectProjectKind(plain)).toBe('folder');
+    expect(grants().split('\n')).toEqual([checkout]);
+  } finally {
+    delete process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+    delete process.env.GIT_CONFIG_NOSYSTEM;
+    process.env.GIT_CONFIG_GLOBAL = sharedGlobalConfig;
+  }
 });

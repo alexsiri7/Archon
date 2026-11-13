@@ -10,7 +10,7 @@ description: |
   stage and owns what follows its ending. It never pauses for a person: run
   archon-plan, which adds that pause, by hand.
 
-model: large
+model: ['@planner', large]
 
 inputs:
   work:
@@ -23,6 +23,12 @@ inputs:
     description: >-
       Optional path to a prior investigation report to build on — its claims are
       verified, not trusted. Empty means no prior report.
+  related:
+    default: "[]"
+    description: >-
+      Related work triage found, as a JSON list of { url, relation }: overlapping
+      open issues, closed earlier attempts, recent merged changes on the same
+      surface. Defaults to an empty list.
 
 # ready:false is a valid completion (see the plan node): the run succeeds with
 # an authored outcome of false — lifecycle status and work outcome are separate facts.
@@ -30,18 +36,6 @@ returns: plan
 outcome_field: ready
 
 nodes:
-  # The directory of the pack's default policy documents in this run's captured
-  # source, the same in a source checkout and a binary install. The prompt names the
-  # policy file it needs and chooses between the project's own and the default.
-  - id: policy
-    script: policy
-    runtime: bun
-    output_format:
-      type: object
-      properties:
-        defaults: { type: string }
-      required: [defaults]
-
   # Open questions are a valid outcome, not a failure: the calls only a person can
   # make, named, beat a plan built on guesses. Whether the plan is ready is the
   # planner's judgment; consumers gate on $plan.output.ready and relay
@@ -50,9 +44,6 @@ nodes:
   # holds the rule: not ready always names at least one question.
   - id: plan
     command: plan
-    depends_on: [policy]
-    with:
-      policy_defaults: "$policy.output.defaults"
     # Advisory on both counts, and the engine holds both: it fails this node with
     # the touched paths named if the checkout is modified, and it refuses the
     # artifact pointer below if the report it names does not exist.

@@ -1,3 +1,4 @@
+// @archon-test-isolated
 /**
  * Installed workflow packs in the one catalog: every consumer resolves them through
  * `discoverWorkflowsWithConfig`, only manifest entrypoints are dispatchable, and a run
@@ -9,19 +10,19 @@
 import { providerRegistry, claudeDescriptor } from '@archon/providers';
 import { registerBuiltinProviders } from '@archon/providers/in-process';
 import { readHomeMcpDirectory } from './compiled-command';
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { cp, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { packTreePath, receiptPath } from '@archon/plugin-manifest/store';
-import { trackTempRoots } from '@archon/paths/test-utils';
+import { removeTempTree, trackTempRoots } from '@archon/paths/test-utils';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
 import { findWorkflow, resolveWorkflowName } from './router';
 import { validateWorkflowResources } from './validator';
-import { loadCommandPrompt } from './executor-shared';
+import { loadCommandPrompt } from './load-command-prompt';
 import { discoverScriptsForCwd } from './script-discovery';
-import { resolveContinuationWorkflow } from './executor';
-import { resolveFanOutChildDefinition } from './dag-executor';
+import { resolveContinuationWorkflow } from './run-source';
+import { resolveFanOutChildDefinition } from './dag/nodes/compose-fan-out/compose-fan-out';
 import {
   captureWorkflowSource,
   capturedSourceRoots,
@@ -29,8 +30,25 @@ import {
   type WorkflowSourceCapture,
 } from './workflow-source';
 import { WORKFLOW_SOURCE_METADATA_KEY } from './schemas/workflow-run';
-import { isAgentNode, type ResolvedWorkflow } from './schemas';
+import { isAgentNode, type ResolvedWorkflow, type WorkflowPack } from './schemas';
 import type { WorkflowDeps } from './deps';
+import * as bundleInventory from './defaults/bundle-inventory';
+
+// A fake bundled pack stands in for the shipped one. Its workflow declares an MCP file
+// so the checkout-only MCP assertion below has a bundled node to hold to.
+const bundleRoot = await mkdtemp(join(tmpdir(), 'installed-packs-bundle-'));
+afterAll(() => removeTempTree(bundleRoot));
+await mkdir(join(bundleRoot, 'fake', 'review'), { recursive: true });
+await writeFile(
+  join(bundleRoot, 'fake', 'review', 'fake-review.yaml'),
+  'name: fake-review\ndescription: Bundled review\nnodes:\n  - id: check\n    prompt: Check\n    mcp: servers.json\n'
+);
+const actualPaths = await import('@archon/paths');
+mock.module('@archon/paths', () => ({
+  ...actualPaths,
+  getBundledWorkflowsPath: () => bundleRoot,
+}));
+spyOn(bundleInventory, 'readBundleIndex').mockResolvedValue(['fake']);
 
 const trackTempRoot = trackTempRoots();
 const loadConfig = async (): Promise<Record<string, never>> => ({});
@@ -220,9 +238,26 @@ nodes:
     expect(issues[0].message).toBe(
       `MCP config file not found: 'servers.json'. Tried: ${join(project, 'servers.json')}`
     );
-    for (const bundled of catalog.workflows.filter(e => e.source === 'bundled')) {
-      for (const node of bundled.workflow.nodes) expect(readHomeMcpDirectory(node)).toBeUndefined();
-    }
+    const bundled = catalog.workflows.find(e => e.workflow.name === 'fake-review');
+    expect(bundled?.source).toBe('bundled');
+    expect(bundled?.workflow.nodes.map(node => readHomeMcpDirectory(node))).toEqual([undefined]);
+  });
+
+  test('an installed pack is keyed owner.<manifest name>, not by its install path', async () => {
+    const kit = reviewKit();
+    await install({
+      ...kit,
+      files: { ...kit.files, '.pack/pack.yaml': 'inputs:\n  depth:\n    default: shallow\n' },
+    });
+    const { workflows, support } = await discover();
+    const review = workflows.find(entry => entry.workflow.name === REVIEW);
+    const expected: WorkflowPack = {
+      key: 'acme.review-kit',
+      source: 'installed',
+      settings: { depth: { type: 'string', default: 'shallow' } },
+    };
+    expect(review?.workflow.pack).toEqual(expected);
+    expect(support?.find(entry => entry.workflow.name === HELPER)?.workflow.pack).toEqual(expected);
   });
 
   test('entrypoints are dispatchable as owner/plugin:entrypoint; support workflows only compose', async () => {
@@ -243,9 +278,7 @@ nodes:
     expect(names(workflows)).not.toContain('code-review');
     expect(names(support ?? [])).toEqual([HELPER]);
     // Bundled workflows are still there, as before.
-    expect(workflows.find(entry => entry.workflow.name === 'archon-review')?.source).toBe(
-      'bundled'
-    );
+    expect(workflows.find(entry => entry.workflow.name === 'fake-review')?.source).toBe('bundled');
   });
 
   test('consumer parity: run, routing, validation and resume resolve the same installed workflow', async () => {
@@ -353,7 +386,7 @@ nodes:
 });
 
 describe('installed pack boundaries', () => {
-  test('an incompatible provider receipt is reported without hiding installed workflows', async () => {
+  test('an incompatible provider receipt is excluded from workflow load errors', async () => {
     await install(reviewKit());
     const file = receiptPath(join(home, 'plugins'), 'owner/stale-provider');
     await mkdir(dirname(file), { recursive: true });
@@ -362,6 +395,7 @@ describe('installed pack boundaries', () => {
       JSON.stringify({
         schemaVersion: 1,
         id: 'owner/stale-provider',
+        tag: 'v0.13.0',
         manifest: {
           schemaVersion: 1,
           kind: 'provider',
@@ -372,12 +406,12 @@ describe('installed pack boundaries', () => {
         commit: COMMIT_A,
         installedAt: new Date(0).toISOString(),
         files: [{ path: 'archon-provider-claude', sha256: 'b'.repeat(64) }],
-        descriptor: { ...claudeDescriptor, protocol: 1 },
+        descriptor: { ...claudeDescriptor, protocol: 2 },
       })
     );
     const { workflows, errors } = await discover();
     expect(names(workflows)).toContain(REVIEW);
-    expect(errors.some(error => error.error.includes(file))).toBe(true);
+    expect(errors).toEqual([]);
   });
 
   test('another pack and a project workflow cannot include a support workflow', async () => {
@@ -448,7 +482,7 @@ describe('installed pack boundaries', () => {
     const definitions = (await discover()).workflows.map(entry => entry.workflow);
     expect(resolveWorkflowName('acme/review-kit:rev', definitions)).toBeUndefined();
     expect(resolveWorkflowName('acme/review:review', definitions)).toBeUndefined();
-    expect(resolveWorkflowName('ACME/review-kit:review', definitions)?.name).toBe(REVIEW);
+    expect(resolveWorkflowName('ACME/review-kit:review', definitions)).toBeUndefined();
   });
 
   test('a project workflow cannot shadow an installed name', async () => {

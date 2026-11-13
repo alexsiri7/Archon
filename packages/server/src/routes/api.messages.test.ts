@@ -1,11 +1,17 @@
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, spyOn } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
-import type { WebAdapter } from '../adapters/web';
+import { SSEStreamingApi } from 'hono/streaming';
+import { WebAdapter } from '../adapters/web';
+import { MessagePersistence } from '../adapters/web/persistence';
+import { SSETransport, DASHBOARD_STREAM } from '../adapters/web/transport';
+import { WorkflowEventBridge } from '../adapters/web/workflow-bridge';
 import { validationErrorHook } from './openapi-defaults';
+import { getLog } from './api-route-kit';
 import { makeIdleLockStats } from '../test/conversation-lock-fixtures';
 import { makeListDashboardRunsMock, mockAllWorkflowModules } from '../test/workflow-mock-factories';
 import { MAX_TOOL_OUTPUT_CHARS } from '../adapters/web/truncate';
+import { sendMessageBodySchema } from './schemas/conversation.schemas';
 
 // ---------------------------------------------------------------------------
 // Mock setup — must be before dynamic imports of mocked modules
@@ -25,7 +31,6 @@ const mockFindConversationByPlatformId = mock(
       codebase_id: string | null;
     }
 );
-const mockUpdateConversationTitle = mock(async (_id: string, _title: string) => {});
 const mockAddMessage = mock(
   async (_conversationId: string, _role: 'user' | 'assistant', _content: string) => ({
     id: 'msg-uuid-1',
@@ -126,7 +131,7 @@ mock.module('@archon/core/db/conversations', () => ({
     ai_assistant_type: 'claude',
   })),
   softDeleteConversation: mock(async () => {}),
-  updateConversationTitle: mockUpdateConversationTitle,
+  updateConversationTitle: mock(async () => {}),
   getConversationById: mock(async () => null),
 }));
 
@@ -142,6 +147,9 @@ mock.module('@archon/core/db/isolation-environments', () => ({
 }));
 
 mock.module('@archon/core/db/workflows', () => ({
+  getRunIdsByIsolationEnvId: mock(async (): Promise<string[]> => []),
+  getWorkflowRunsByIds: mock(async () => []),
+  getWorkflowRunForAttention: mock(async () => null),
   listWorkflowRuns: mock(async () => []),
   listDashboardRuns: makeListDashboardRunsMock(),
   getWorkflowRun: mock(async () => null),
@@ -201,13 +209,15 @@ const MOCK_MESSAGES = [
   },
 ];
 
-function makeApp(): { app: OpenAPIHono; mockWebAdapter: WebAdapter } {
+function makeApp(webAdapter?: WebAdapter): { app: OpenAPIHono; mockWebAdapter: WebAdapter } {
   const app = new OpenAPIHono({ defaultHook: validationErrorHook });
-  const mockWebAdapter = {
-    setConversationDbId: mock((_platformId: string, _dbId: string) => {}),
-    emitSSE: mock(async () => {}),
-    emitLockEvent: mock(async () => {}),
-  } as unknown as WebAdapter;
+  const mockWebAdapter =
+    webAdapter ??
+    ({
+      setConversationDbId: mock((_platformId: string, _dbId: string) => {}),
+      emitSSE: mock(async () => {}),
+      emitLockEvent: mock(async () => {}),
+    } as unknown as WebAdapter);
   const mockLockManager = {
     acquireLock: mock(async (_id: string, fn: () => Promise<void>) => {
       await fn();
@@ -228,6 +238,97 @@ describe('POST /api/conversations/:id/message', () => {
     mockFindConversationByPlatformId.mockReset();
     mockHandleMessage.mockReset();
     mockAddMessage.mockReset();
+  });
+
+  test('publishes JSON and multipart message request bodies', async () => {
+    const { app } = makeApp();
+    const response = await app.request('/api/openapi.json');
+    expect(response.status).toBe(200);
+    const doc = (await response.json()) as ReturnType<typeof app.getOpenAPIDocument>;
+    type Schema = NonNullable<NonNullable<typeof doc.components>['schemas']>[string];
+    function resolve(schema: Schema | undefined): Exclude<Schema, { $ref: string }> {
+      if (!schema) throw new Error('Missing schema');
+      if ('$ref' in schema)
+        return resolve(doc.components?.schemas?.[schema.$ref.split('/').at(-1) ?? '']);
+      return schema;
+    }
+    const body = doc.paths['/api/conversations/{id}/message']?.post?.requestBody;
+    if (!body || '$ref' in body) throw new Error('Missing message request body');
+    expect(body.required).toBe(true);
+    expect(Object.keys(body.content)).toEqual(['application/json', 'multipart/form-data']);
+    const json = resolve(body.content['application/json']?.schema);
+    const form = resolve(body.content['multipart/form-data']?.schema);
+    for (const schema of [json, form]) {
+      expect(schema.required).toEqual(['message']);
+      expect(resolve(schema.properties?.message)).toMatchObject({ type: 'string', minLength: 1 });
+    }
+    expect(json.properties?.files).toBeUndefined();
+    const files = resolve(form.properties?.files);
+    expect(files).toMatchObject({ type: 'array', maxItems: 5 });
+    if (!files.items || Array.isArray(files.items)) throw new Error('Missing file item schema');
+    expect(resolve(files.items)).toMatchObject({ type: 'string', format: 'binary' });
+  });
+
+  test.each(['json', 'multipart'] as const)(
+    '%s message validation follows the published schema',
+    async transport => {
+      mockFindConversationByPlatformId.mockResolvedValue(null);
+      const { app } = makeApp();
+      for (const message of [undefined, '', 'a', ' ', 'Hello']) {
+        mockHandleMessage.mockClear();
+        const form = new FormData();
+        if (message !== undefined) form.set('message', message);
+        const valid = sendMessageBodySchema.safeParse({ message }).success;
+        const response = await app.request('/api/conversations/web-test-abc/message', {
+          method: 'POST',
+          ...(transport === 'json'
+            ? {
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message }),
+              }
+            : { body: form }),
+        });
+        expect(response.status).toBe(valid ? 200 : 400);
+        expect(await response.json()).toEqual(
+          valid
+            ? { accepted: true, status: 'started' }
+            : { error: 'message must be a non-empty string' }
+        );
+        expect(mockHandleMessage).toHaveBeenCalledTimes(valid ? 1 : 0);
+      }
+    }
+  );
+
+  test.each(['too many', 'too large'] as const)('refuses %s attachments', async kind => {
+    mockFindConversationByPlatformId.mockResolvedValue(null);
+    const { app } = makeApp();
+    const form = new FormData();
+    form.set('message', 'Hello');
+    for (let index = 0; index < (kind === 'too many' ? 6 : 1); index++) {
+      form.append(
+        'files',
+        new File(
+          [kind === 'too large' ? new Uint8Array(10 * 1024 * 1024 + 1) : 'hello'],
+          'file.txt',
+          {
+            type: 'text/plain',
+          }
+        )
+      );
+    }
+    const response = await app.request('/api/conversations/web-test-abc/message', {
+      method: 'POST',
+      body: form,
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      error:
+        kind === 'too many'
+          ? 'Maximum 5 files per message'
+          : 'File "file.txt" exceeds the 10 MB size limit',
+    });
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
   });
 
   test('accepts a valid message and dispatches to orchestrator', async () => {
@@ -326,9 +427,24 @@ describe('POST /api/conversations/:id/message', () => {
     expect(response.status).toBe(400);
 
     const body = (await response.json()) as { error: string };
-    // Zod validation returns "message: Required" before the handler runs
     expect(body.error).toContain('message');
   });
+
+  test.each(['null', 'true', '42', '"Hello"', '[]', '["Hello"]'])(
+    'returns 400 for a non-object JSON body: %s',
+    async body => {
+      const { app } = makeApp();
+      const response = await app.request('/api/conversations/web-test-abc/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'message must be a non-empty string' });
+      expect(mockHandleMessage).not.toHaveBeenCalled();
+      expect(mockAddMessage).not.toHaveBeenCalled();
+    }
+  );
 
   test('returns 400 for malformed JSON body', async () => {
     const { app } = makeApp();
@@ -584,82 +700,172 @@ describe('GET /api/conversations/:id/messages — tool output bounding', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Tests: PATCH /api/conversations/:id
-// ---------------------------------------------------------------------------
+describe('SSE route replay', () => {
+  test.each(['web-test-abc', DASHBOARD_STREAM])(
+    'retains cancelled replay and drains it once through /api/stream/%s',
+    async conversationId => {
+      const transport = new SSETransport();
+      const adapter = new WebAdapter(
+        transport,
+        new MessagePersistence((id, event) => transport.emit(id, event)),
+        new WorkflowEventBridge(transport)
+      );
+      const { app } = makeApp(adapter);
+      type ResponseReader = Pick<ReadableStreamDefaultReader<Uint8Array>, 'read' | 'cancel'>;
+      const readers: ResponseReader[] = [];
+      const heartbeatWaits: ReturnType<typeof Promise.withResolvers<void>>[] = [];
+      // Hold heartbeat scheduling outside this delivery test and release every route in teardown.
+      const sleep = spyOn(SSEStreamingApi.prototype, 'sleep').mockImplementation(() => {
+        const wait = Promise.withResolvers<void>();
+        heartbeatWaits.push(wait);
+        return wait.promise;
+      });
+      async function settleReplay(): Promise<void> {
+        for (let i = 0; i < 40; i++) await Promise.resolve();
+      }
+      async function connect(): Promise<ResponseReader> {
+        const response = await app.request(`/api/stream/${conversationId}`);
+        expect(response.status).toBe(200);
+        expect(response.headers.get('Content-Type')).toContain('text/event-stream');
+        if (!response.body) throw new Error('Missing SSE response body');
+        const reader = response.body.getReader();
+        readers.push(reader);
+        expect(await read(reader)).toContain('"type":"heartbeat"');
+        return reader;
+      }
+      async function read(reader: ResponseReader): Promise<string> {
+        const chunk = await reader.read();
+        expect(chunk.done).toBe(false);
+        return new TextDecoder().decode(chunk.value);
+      }
+      try {
+        for (const event of ['first', 'second', 'third', 'fourth']) {
+          await adapter.emitSSE(conversationId, event);
+        }
+        const original = await connect();
+        expect(await read(original)).toBe('data: first\n\n');
+        // Hono prefetches second; third is pending when the response is cancelled.
+        await settleReplay();
+        await original.cancel();
+        await settleReplay();
 
-describe('PATCH /api/conversations/:id', () => {
-  beforeEach(() => {
-    mockFindConversationByPlatformId.mockReset();
-    mockUpdateConversationTitle.mockReset();
-  });
+        const reconnected = await connect();
+        expect(await read(reconnected)).toBe('data: third\n\n');
+        expect(await read(reconnected)).toBe('data: fourth\n\n');
+        await settleReplay();
+        const live = adapter.emitSSE(conversationId, 'after replay');
+        expect(await read(reconnected)).toBe('data: after replay\n\n');
+        await live;
+        await reconnected.cancel();
+        await settleReplay();
 
-  test('updates conversation title and returns success', async () => {
-    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
-    mockUpdateConversationTitle.mockImplementationOnce(async () => {});
+        const later = await connect();
+        const next = adapter.emitSSE(conversationId, 'after reconnect');
+        expect(await read(later)).toBe('data: after reconnect\n\n');
+        await next;
+      } finally {
+        for (const reader of readers) await reader.cancel();
+        for (const wait of heartbeatWaits) wait.reject(new Error('cancel'));
+        await settleReplay();
+        sleep.mockRestore();
+        transport.stop();
+      }
+    }
+  );
+});
 
-    const { app } = makeApp();
-    const response = await app.request('/api/conversations/web-test-abc', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'Updated Title' }),
-    });
-    expect(response.status).toBe(200);
-
-    const body = (await response.json()) as { success: boolean };
-    expect(body.success).toBe(true);
-    expect(mockUpdateConversationTitle).toHaveBeenCalledWith(MOCK_CONV.id, 'Updated Title');
-  });
-
-  test('truncates title to 255 characters', async () => {
-    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
-    mockUpdateConversationTitle.mockImplementationOnce(async () => {});
-
-    const { app } = makeApp();
-    const longTitle = 'x'.repeat(400);
-    await app.request('/api/conversations/web-test-abc', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: longTitle }),
-    });
-
-    const lastCall = mockUpdateConversationTitle.mock.calls.at(-1) as [string, string];
-    expect(lastCall[1].length).toBe(255);
-  });
-
-  test('returns success without updating title when body has no title field', async () => {
-    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
-
-    const { app } = makeApp();
-    const callsBefore = mockUpdateConversationTitle.mock.calls.length;
-    const response = await app.request('/api/conversations/web-test-abc', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ someOtherField: 'value' }),
-    });
-    expect(response.status).toBe(200);
-    expect(mockUpdateConversationTitle.mock.calls.length).toBe(callsBefore);
-  });
-
-  test('returns 404 when conversation not found', async () => {
-    mockFindConversationByPlatformId.mockImplementationOnce(async () => null);
-
-    const { app } = makeApp();
-    const response = await app.request('/api/conversations/unknown-id', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: 'New Title' }),
-    });
-    expect(response.status).toBe(404);
-  });
-
-  test('returns 400 for malformed JSON body', async () => {
-    const { app } = makeApp();
-    const response = await app.request('/api/conversations/web-test-abc', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: 'not valid json {{{',
-    });
-    expect(response.status).toBe(400);
-  });
+describe('SSE heartbeat lifecycle', () => {
+  for (const conversationId of ['web-test-abc', DASHBOARD_STREAM]) {
+    test.each(['abort', 'close', 'error'] as const)(
+      `${conversationId} stops heartbeats and finishes after %s`,
+      async disconnect => {
+        const transport = new SSETransport();
+        const webAdapter = new WebAdapter(
+          transport,
+          new MessagePersistence((id, event) => transport.emit(id, event)),
+          new WorkflowEventBridge(transport)
+        );
+        const { app } = makeApp(webAdapter);
+        const waits: ReturnType<typeof Promise.withResolvers<void>>[] = [];
+        let activeStream: SSEStreamingApi | undefined;
+        const sleep = spyOn(SSEStreamingApi.prototype, 'sleep').mockImplementation(function (
+          this: SSEStreamingApi,
+          ms: number
+        ) {
+          expect(ms).toBe(30000);
+          activeStream = this;
+          const wait = Promise.withResolvers<void>();
+          waits.push(wait);
+          return wait.promise;
+        });
+        const write = spyOn(SSEStreamingApi.prototype, 'writeSSE');
+        const close = spyOn(SSEStreamingApi.prototype, 'close');
+        const remove = spyOn(webAdapter, 'removeStream');
+        const register = spyOn(webAdapter, 'registerStream');
+        const warn = spyOn(getLog(), 'warn').mockClear();
+        const failure = new Error('cancel is part of an unexpected failure message');
+        async function settle(): Promise<void> {
+          for (let i = 0; i < 40; i++) await Promise.resolve();
+        }
+        const response = await app.request(`/api/stream/${conversationId}`);
+        if (!response.body) throw new Error('Missing SSE response body');
+        const reader = response.body.getReader();
+        try {
+          expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+            '"type":"heartbeat"'
+          );
+          await settle();
+          expect(waits).toHaveLength(1);
+          waits[0]!.resolve();
+          expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+            '"type":"heartbeat"'
+          );
+          await settle();
+          expect(waits).toHaveLength(2);
+          expect(write).toHaveBeenCalledTimes(2);
+          if (!activeStream) throw new Error('Heartbeat did not start');
+          if (disconnect === 'abort') {
+            await reader.cancel();
+            expect(activeStream.aborted).toBe(true);
+            expect(activeStream.closed).toBe(false);
+          } else if (disconnect === 'close') {
+            await activeStream.close();
+            expect(activeStream.closed).toBe(true);
+            expect(activeStream.aborted).toBe(false);
+          }
+          const closesBeforeWake = close.mock.calls.length;
+          if (disconnect === 'error') waits[1]!.reject(failure);
+          else waits[1]!.resolve();
+          await settle();
+          expect(write).toHaveBeenCalledTimes(2);
+          expect(waits).toHaveLength(2);
+          // Hono closes the stream after the route callback returns.
+          expect(close).toHaveBeenCalledTimes(closesBeforeWake + 1);
+          expect(remove).toHaveBeenCalledWith(conversationId, register.mock.calls[0]![1]);
+          expect(transport.hasActiveStream(conversationId)).toBe(false);
+          if (disconnect === 'error') {
+            expect(warn).toHaveBeenCalledWith(
+              expect.objectContaining({ err: failure }),
+              conversationId === DASHBOARD_STREAM
+                ? 'dashboard_sse_heartbeat_error'
+                : 'sse_heartbeat_error'
+            );
+          } else {
+            expect(warn).not.toHaveBeenCalled();
+          }
+        } finally {
+          await reader.cancel();
+          for (const wait of waits) wait.reject(new Error('test teardown'));
+          await settle();
+          sleep.mockRestore();
+          write.mockRestore();
+          close.mockRestore();
+          remove.mockRestore();
+          register.mockRestore();
+          warn.mockRestore();
+          transport.stop();
+        }
+      }
+    );
+  }
 });

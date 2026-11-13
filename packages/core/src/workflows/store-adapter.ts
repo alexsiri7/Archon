@@ -1,3 +1,4 @@
+import { createRunResourceRelease } from '../services/cleanup/run-verification-images';
 /**
  * WorkflowStore adapter — bridges @archon/core DB modules to the
  * IWorkflowStore trait defined in @archon/workflows.
@@ -14,13 +15,13 @@ import {
   type WorkflowStoreKind,
 } from '@archon/workflows/store';
 import type { WorkflowConfig, WorkflowDeps } from '@archon/workflows/deps';
-import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowEventRow } from '@archon/workflows/schemas/workflow-event';
 import type { MergedConfig } from '../config/config-types';
 import * as workflowDb from '../db/workflows';
 import * as resourceStarts from '../db/resource-starts';
 import { toHydratedTimestamp } from '../db/timestamps';
 import * as workflowEventDb from '../db/workflow-events';
+import { listMetricRecords } from '../db/workflow-metrics';
 import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
 import {
   listWorkflowRunNodeSessions,
@@ -30,7 +31,7 @@ import * as codebaseDb from '../db/codebases';
 import type { IIsolationStore } from '@archon/isolation';
 import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '../services/provider-admission';
-import type { WorktreeOwnershipReaders } from '../services/cleanup-service';
+import type { WorktreeOwnershipReaders } from '../services/cleanup/run-worktree';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
 import { createLogger } from '@archon/paths';
 import type { IGitHubAppAuthProvider } from '../github-auth/types';
@@ -166,11 +167,14 @@ export function createWorkflowStore(): IWorkflowStore {
           rows.map(hydrateWorkflowEventRow),
         ])
       ),
+    listMetricRecords,
     findWorkflowRunsByIdPrefix: workflowDb.findWorkflowRunsByIdPrefix,
     createWorkflowRun: workflowDb.createWorkflowRun,
     claimPendingWorkflowRun: workflowDb.claimPendingWorkflowRun,
     recordWorkflowRunCheckoutBaseline: workflowDb.recordWorkflowRunCheckoutBaseline,
     getWorkflowRun: workflowDb.getWorkflowRun,
+    getWorkflowRunsByIds: workflowDb.getWorkflowRunsByIds,
+    getWorkflowRunForAttention: workflowDb.getWorkflowRunForAttention,
     findChildRuns: workflowDb.findChildRuns,
     getRunAncestry: workflowDb.getRunAncestry,
     getActiveWorkflowRunByPath: workflowDb.getActiveWorkflowRunByPath,
@@ -187,12 +191,9 @@ export function createWorkflowStore(): IWorkflowStore {
     releasePausedRunSlot: workflowDb.releasePausedRunSlot,
     recoverCancelledFanOutRun: workflowDb.recoverCancelledFanOutRun,
     updateWorkflowRun: workflowDb.updateWorkflowRun,
+    updateWorkflowRunMetadataIfRunning: workflowDb.updateWorkflowRunMetadataIfRunning,
     updateWorkflowActivity: workflowDb.updateWorkflowActivity,
-    // DB returns string | null; IWorkflowStore declares WorkflowRunStatus | null.
-    // The remote_agent_workflow_runs.status column is constrained to valid enum values
-    // in SQL, so this cast is safe as long as the column constraint matches WorkflowRunStatus.
-    getWorkflowRunStatus: id =>
-      workflowDb.getWorkflowRunStatus(id) as Promise<WorkflowRunStatus | null>,
+    getWorkflowRunStatus: workflowDb.getWorkflowRunStatus,
     completeWorkflowRun: workflowDb.completeWorkflowRun,
     failWorkflowRun: workflowDb.failWorkflowRun,
     pauseWorkflowRun: workflowDb.pauseWorkflowRun,
@@ -246,7 +247,7 @@ export function initializeWorkflowGitHubAppAuth(
 }
 
 export interface CompletedRunWorktreeTools {
-  cleanup: typeof import('../services/cleanup-service');
+  cleanup: typeof import('../services/cleanup/run-worktree');
   store: IIsolationStore;
   readers: WorktreeOwnershipReaders;
 }
@@ -277,11 +278,11 @@ export function completedRunWorktreeDeps(
   };
 }
 
-// Lazy for the same reason as the SQL host's abandon release: cleanup-service loads
-// the isolation provider and repo config.
+// Lazy for the same reason as the SQL host's abandon release: the run worktree cleanup
+// loads the isolation provider.
 const sqlCompletedRunWorktree = completedRunWorktreeDeps(async () => {
   const [cleanup, isolationDb] = await Promise.all([
-    import('../services/cleanup-service'),
+    import('../services/cleanup/run-worktree'),
     import('../db/isolation-environments'),
   ]);
   return {
@@ -308,6 +309,7 @@ export function createWorkflowDeps(
   return {
     store,
     credentialStore,
+    releaseRunResources: createRunResourceRelease(store),
     providers: providerRegistry,
     getAgentProvider,
     loadConfig: loadMergedConfig,
@@ -419,7 +421,7 @@ export function createWorkflowDeps(
             }
           },
         }
-      : // Files hold no stored credentials; preflight refuses a run that would need them.
+      : // Files hold no stored credentials; providers authenticate through native configuration.
         { isPerUserProviderKeysEnabled: () => isPerUserProviderKeysEnabled() }),
   };
 }

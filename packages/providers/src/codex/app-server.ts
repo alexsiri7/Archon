@@ -12,6 +12,7 @@ import type { GetAccountResponse } from './protocol/v2/GetAccountResponse';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { delimiter } from 'node:path';
 import { createLogger } from '@archon/paths';
+import type { ProviderLifecycleEvent } from '@archon/provider-contract';
 import {
   collectCredentialValues,
   redactCredentialValues,
@@ -22,6 +23,7 @@ import type { ClientRequest } from './protocol/ClientRequest';
 import type { ServerNotification } from './protocol/ServerNotification';
 import type { ServerRequest } from './protocol/ServerRequest';
 import type { CodexBinary } from './binary-resolver';
+import { terminateTree } from '@archon/paths/plugin-process';
 
 const TOOL_CALL_METHOD = 'item/tool/call';
 
@@ -31,11 +33,13 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+export type ProcessGroupOwner = 'connection' | 'host';
+
 /** Process spawner, injectable so tests drive a fake child instead of a real process. */
 export type Spawner = (
   command: string,
   args: string[],
-  options: { env: Record<string, string>; stdio: ['pipe', 'pipe', 'pipe'] }
+  options: { env: Record<string, string>; stdio: ['pipe', 'pipe', 'pipe']; detached: boolean }
 ) => ChildProcessWithoutNullStreams;
 
 type Method = ClientRequest['method'];
@@ -53,10 +57,25 @@ export class JsonRpcError extends Error {
   }
 }
 
+type ProcessExit = { kind: 'exited'; code: number | null; signal: NodeJS.Signals | null };
+
 /** How the connection ended. */
 export type ConnectionEnd =
-  | { kind: 'exited'; code: number | null; signal: NodeJS.Signals | null }
-  | { kind: 'spawn_failed'; error: NodeJS.ErrnoException };
+  | ProcessExit
+  | { kind: 'spawn_failed'; error: NodeJS.ErrnoException }
+  | { kind: 'cleanup_failed'; exit: ProcessExit; error: Error };
+
+/**
+ * How often an app-server that has not exited yet is reported. There is no deadline: a
+ * Codex shutting down on a loaded machine was seen taking several seconds longer each
+ * time load rose, then exiting 0, and a deadline turned that slow cleanup into a failed
+ * node. Cancelling the run stops the provider plugin, which ends the wait.
+ */
+const TERM_EXIT_WARN_MS = 30_000;
+
+// Descendants can inherit stdio handles and hold 'close' open after Codex exits.
+// Keep reading final JSONL frames, but bound that drain independently of a live process.
+const POST_EXIT_DRAIN_MS = 250;
 
 /** How much raw stderr a connection buffers, and how much of it becomes evidence. */
 const STDERR_BUFFER_CHARS = 8000;
@@ -113,9 +132,14 @@ export class ConnectionClosedError extends Error {
 }
 
 function describeEnd(end: ConnectionEnd): string {
-  return end.kind === 'spawn_failed'
-    ? `could not start: ${end.error.message}`
-    : `exited (${end.signal ? `signal ${end.signal}` : `code ${String(end.code)}`})`;
+  switch (end.kind) {
+    case 'spawn_failed':
+      return `could not start: ${end.error.message}`;
+    case 'cleanup_failed':
+      return `${describeEnd(end.exit)}; descendant cleanup failed: ${end.error.message}`;
+    case 'exited':
+      return `exited (${end.signal ? `signal ${end.signal}` : `code ${String(end.code)}`})`;
+  }
 }
 
 /** Whether `promise` settles within `ms`. A rejection counts as settled. */
@@ -140,6 +164,14 @@ function pathKey(env: Record<string, string>): string {
   return Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH';
 }
 
+function parseObjectFrame(line: string): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(line);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Expected a JSON object frame');
+  }
+  return parsed as Record<string, unknown>;
+}
+
 export class AppServerConnection {
   private readonly toolCalls = new Set<Promise<void>>();
   private toolCallHandler: ((params: unknown) => Promise<DynamicToolCallResponse>) | undefined;
@@ -162,18 +194,23 @@ export class AppServerConnection {
   private readonly queue: ServerNotification[] = [];
   private wake: (() => void) | undefined;
   private endedWith: ConnectionEnd | undefined;
+  private hasExited = false;
+  private drainTimer: ReturnType<typeof setTimeout> | undefined;
+  private closing = false;
   private responded = false;
   private stderrTail = '';
   /** Credential values from the process env, redacted from its stderr. */
   private readonly credentialValues: readonly string[];
   private readonly endSignal = Promise.withResolvers<ConnectionEnd>();
-  /** Resolves once the process is gone, however it ended. */
+  /** Resolves after process exit, bounded pipe drainage, and connection-owned POSIX cleanup. */
   readonly ended = this.endSignal.promise;
 
   private constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     env: Record<string, string>,
-    protectedEnvKeys?: readonly string[]
+    protectedEnvKeys: readonly string[] | undefined,
+    readonly runId: string | undefined,
+    private readonly processGroupOwner: ProcessGroupOwner
   ) {
     this.credentialValues = collectCredentialValues(env, protectedEnvKeys);
     let buffered = '';
@@ -198,11 +235,30 @@ export class AppServerConnection {
     child.stdin.on('error', error => {
       getLog().debug({ err: error }, 'codex.app_server_stdin_error');
     });
+    child.stdin.once('finish', () => {
+      if (this.runId) getLog().debug({ runId: this.runId }, 'codex.stdin_finished');
+    });
+    child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+      this.hasExited = true;
+      if (this.runId) getLog().debug({ runId: this.runId, code, signal }, 'codex.child_exit');
+      if (this.closing) return;
+      this.drainTimer = setTimeout(() => {
+        getLog().debug(
+          { runId: this.runId, drainMs: POST_EXIT_DRAIN_MS },
+          'codex.post_exit_drain_expired'
+        );
+        this.close({ kind: 'exited', code, signal });
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, POST_EXIT_DRAIN_MS);
+    });
     child.once('error', (error: NodeJS.ErrnoException) => {
       this.close({ kind: 'spawn_failed', error });
     });
-    // 'close', not 'exit': it fires after stdout drained, so the last frames are read first.
+    // Prefer natural closure so final frames are read without paying the drain deadline.
     child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (this.runId) getLog().debug({ runId: this.runId }, 'codex.child_close');
       this.close({ kind: 'exited', code, signal });
     });
   }
@@ -213,7 +269,15 @@ export class AppServerConnection {
     args: string[],
     env: Record<string, string>,
     spawner: Spawner = spawn as unknown as Spawner,
-    protectedEnvKeys?: readonly string[]
+    {
+      protectedEnvKeys,
+      runId,
+      processGroupOwner = 'connection',
+    }: {
+      protectedEnvKeys?: readonly string[];
+      runId?: string;
+      processGroupOwner?: ProcessGroupOwner;
+    } = {}
   ): AppServerConnection {
     const childEnv = { ...env };
     if (binary.pathDirs.length > 0) {
@@ -223,8 +287,9 @@ export class AppServerConnection {
     const child = spawner(binary.path, ['app-server', ...args], {
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32' && processGroupOwner === 'connection',
     });
-    return new AppServerConnection(child, childEnv, protectedEnvKeys);
+    return new AppServerConnection(child, childEnv, protectedEnvKeys, runId, processGroupOwner);
   }
 
   /** Sends a request and resolves with its result, or rejects with a {@link JsonRpcError}. */
@@ -259,19 +324,33 @@ export class AppServerConnection {
   }
 
   /**
-   * Ends the process: close stdin, which makes app-server exit, then SIGTERM if it has not
-   * exited within `graceMs`. Never SIGKILL: SIGTERM lets Codex stop the commands it
-   * started, while SIGKILL orphans them.
+   * Ends the process: close stdin, which makes app-server exit, then wait for the exit
+   * and bounded pipe drainage. With `termAfterMs`, a process that has not exited by then is
+   * sent SIGTERM. Without it, none is sent: a SIGTERM that lands while Codex is still
+   * exiting after stdin closed makes it wait about 40 seconds and exit 1, where it would
+   * have exited 0 within seconds. Never SIGKILL a live app-server: SIGTERM lets Codex
+   * clean up its commands. Connection-owned POSIX groups stop after exit; hosted processes
+   * stay in the host's group.
    */
-  async shutdown(graceMs: number): Promise<ConnectionEnd | undefined> {
+  async shutdown(termAfterMs?: number, warnMs = TERM_EXIT_WARN_MS): Promise<ConnectionEnd> {
     if (this.endedWith) return this.endedWith;
     this.child.stdin.end();
-    if (await this.exitsWithin(graceMs)) return this.endedWith;
-    this.child.kill('SIGTERM');
-    if (!(await this.exitsWithin(graceMs))) {
-      getLog().warn({ pid: this.child.pid }, 'codex.app_server_ignored_sigterm');
+    if (termAfterMs !== undefined && !(await this.exitsWithin(termAfterMs)) && !this.hasExited) {
+      this.child.kill('SIGTERM');
     }
-    return this.endedWith;
+    let waitedMs = 0;
+    while (!(await this.exitsWithin(warnMs))) {
+      waitedMs += warnMs;
+      getLog().warn(
+        {
+          pid: this.child.pid,
+          waitedMs,
+          lifecycle: 'process_still_exiting' satisfies ProviderLifecycleEvent,
+        },
+        'codex.app_server_still_exiting'
+      );
+    }
+    return this.ended;
   }
 
   private exitsWithin(ms: number): Promise<boolean> {
@@ -288,65 +367,78 @@ export class AppServerConnection {
     if (this.endedWith) return;
     let message: Record<string, unknown>;
     try {
-      message = JSON.parse(line) as Record<string, unknown>;
+      message = parseObjectFrame(line);
     } catch {
-      getLog().warn({ line: line.slice(0, 200) }, 'codex.app_server_unparseable_line');
+      // The line can carry model or user text, so only its length is logged.
+      getLog().warn({ bytes: Buffer.byteLength(line) }, 'codex.app_server_unparseable_line');
       return;
     }
     const { id, method } = message;
     if (typeof id === 'number' && typeof method !== 'string') {
-      this.responded = true;
-      const request = this.pending.get(id);
-      if (!request) return;
-      this.pending.delete(id);
-      const error = message.error as { code?: unknown; message?: unknown } | undefined;
-      if (error) {
-        request.reject(
-          new JsonRpcError(
-            request.method,
-            typeof error.code === 'number' ? error.code : 0,
-            typeof error.message === 'string' ? error.message : JSON.stringify(error)
-          )
-        );
-      } else {
-        request.resolve(message.result);
-      }
+      this.receiveResponse(id, message);
       return;
     }
     if (typeof method !== 'string') return;
     if (id !== undefined) {
-      if (method === TOOL_CALL_METHOD && this.toolCallHandler) {
-        const handler = this.toolCallHandler;
-        const operation = Promise.resolve()
-          .then(() => handler(message.params))
-          .then(
-            result => this.send({ id, result }),
-            (error: unknown) => {
-              getLog().error({ err: error }, 'codex.tool_call_failed');
-              this.send({
-                id,
-                result: toolResponse('Archon could not execute the tool call.', false),
-              });
-            }
-          );
-        this.toolCalls.add(operation);
-        void operation.then(() => this.toolCalls.delete(operation));
-        return;
-      }
-      // A request from Codex: approval, user input, elicitation, token refresh. Archon
-      // runs with approvals off and handles none of them, and an unanswered request
-      // stalls the turn, so each gets an error reply at once.
-      getLog().warn({ method }, 'codex.app_server_request_declined');
-      this.send({
-        id,
-        error:
-          method === CHATGPT_TOKEN_REFRESH
-            ? // The method exists; Archon only has no newer token than the one it delivered.
-              { code: -32000, message: CHATGPT_TOKEN_REFRESH_DECLINED }
-            : { code: -32601, message: `Archon does not handle ${method}` },
-      });
+      this.receiveRequest(id, method, message.params);
       return;
     }
+    this.receiveNotification(message);
+  }
+
+  private receiveResponse(id: number, message: Record<string, unknown>): void {
+    this.responded = true;
+    const request = this.pending.get(id);
+    if (!request) return;
+    this.pending.delete(id);
+    const error = message.error as { code?: unknown; message?: unknown } | undefined;
+    if (error) {
+      request.reject(
+        new JsonRpcError(
+          request.method,
+          typeof error.code === 'number' ? error.code : 0,
+          typeof error.message === 'string' ? error.message : JSON.stringify(error)
+        )
+      );
+    } else {
+      request.resolve(message.result);
+    }
+  }
+
+  private receiveRequest(id: unknown, method: string, params: unknown): void {
+    if (method === TOOL_CALL_METHOD && this.toolCallHandler) {
+      const handler = this.toolCallHandler;
+      const operation = Promise.resolve()
+        .then(() => handler(params))
+        .then(
+          result => this.send({ id, result }),
+          (error: unknown) => {
+            getLog().error({ err: error }, 'codex.tool_call_failed');
+            this.send({
+              id,
+              result: toolResponse('Archon could not execute the tool call.', false),
+            });
+          }
+        );
+      this.toolCalls.add(operation);
+      void operation.then(() => this.toolCalls.delete(operation));
+      return;
+    }
+    // A request from Codex: approval, user input, elicitation, token refresh. Archon
+    // runs with approvals off and handles none of them, and an unanswered request
+    // stalls the turn, so each gets an error reply at once.
+    getLog().warn({ method }, 'codex.app_server_request_declined');
+    this.send({
+      id,
+      error:
+        method === CHATGPT_TOKEN_REFRESH
+          ? // The method exists; Archon only has no newer token than the one it delivered.
+            { code: -32000, message: CHATGPT_TOKEN_REFRESH_DECLINED }
+          : { code: -32601, message: `Archon does not handle ${method}` },
+    });
+  }
+
+  private receiveNotification(message: Record<string, unknown>): void {
     this.queue.push(message as unknown as ServerNotification);
     this.wakeReader();
   }
@@ -369,7 +461,30 @@ export class AppServerConnection {
 
   /** The one place the connection ends: pending requests fail and notifications stop. */
   private close(end: ConnectionEnd): void {
-    if (this.endedWith) return;
+    if (this.closing) return;
+    this.closing = true;
+    clearTimeout(this.drainTimer);
+    if (
+      end.kind === 'exited' &&
+      this.child.pid !== undefined &&
+      this.processGroupOwner === 'connection' &&
+      process.platform !== 'win32'
+    ) {
+      void terminateTree(this.child.pid).then(
+        () => this.finishClose(end),
+        (error: unknown) =>
+          this.finishClose({
+            kind: 'cleanup_failed',
+            exit: end,
+            error: error instanceof Error ? error : new Error(String(error)),
+          })
+      );
+    } else {
+      this.finishClose(end);
+    }
+  }
+
+  private finishClose(end: ConnectionEnd): void {
     this.endedWith = end;
     for (const request of this.pending.values()) request.reject(this.closedError(end));
     this.pending.clear();

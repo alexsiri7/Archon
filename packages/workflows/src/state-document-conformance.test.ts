@@ -1,3 +1,4 @@
+// @archon-test-isolated
 import { expect, test } from 'bun:test';
 import { assertStatePutRace, assertStatePatchRace } from './state-document-conformance';
 import { applyStatePatch, type StateRevision } from './state-document-store';
@@ -15,6 +16,7 @@ test('the single-winner contract rejects a read-then-write store', async () => {
           value: input.value,
           operation: { op: 'put' },
           writer: input.writer,
+          lease: null,
           createdAt: new Date().toISOString(),
         };
         history.push(next);
@@ -40,6 +42,7 @@ test('the append contract rejects lost updates from a read-then-write store', as
           value,
           operation: { op: 'patch', ops: input.ops },
           writer: input.writer,
+          lease: null,
           createdAt: new Date().toISOString(),
         };
         history.push(next);

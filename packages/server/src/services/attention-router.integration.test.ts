@@ -124,6 +124,11 @@ test('activation is quiet; new occurrences and terminal follow-ups survive repea
   await Promise.all([router.scan(), router.scan()]);
   await new AttentionRouter([destination], new Set()).scan();
   expect(sender).toHaveBeenCalledTimes(1);
+  expect(sender.mock.calls[0]?.[0]).toEqual(subscription('one'));
+  expect(sender.mock.calls[0]?.[2]).toEqual({
+    vapidDetails: { subject: 'https://archon.diy', ...loadVapidKeys() },
+    timeout: 10_000,
+  });
   expect(JSON.parse(String(sender.mock.calls[0]?.[1]))).toEqual({
     runId: current,
     workflowName: 'nightly',
@@ -158,7 +163,7 @@ test('activation is quiet; new occurrences and terminal follow-ups survive repea
   const snapshot = await getDagResumeSnapshot(current);
   expect(snapshot.completedNodeOutputs.size).toBe(0);
   expect(snapshot.unresolvedNodeStarts.size).toBe(0);
-  expect(snapshot.costUsd).toBe(0);
+  expect(snapshot.costUsd).toBeUndefined();
 });
 
 test('empty activation survives restart and failure retries all browsers without a premature ledger row', async () => {
@@ -430,4 +435,32 @@ test('subscription primary keys are required on both database adapters', async (
       [userId, sub.endpoint, sub.keys.p256dh, sub.keys.auth]
     )
   ).rejects.toThrow();
+});
+
+test('unreadable origins remain diagnostics during activation and valid notice delivery', async () => {
+  const bad = await pause('bad');
+  await getDatabase().query('UPDATE remote_agent_workflow_runs SET origin = $1 WHERE id = $2', [
+    '[]',
+    bad,
+  ]);
+  const stored = async () =>
+    (
+      await getDatabase().query(
+        'SELECT status, origin FROM remote_agent_workflow_runs WHERE id = $1',
+        [bad]
+      )
+    ).rows;
+  const before = await stored();
+  const valid = await pause('baseline');
+  const sender = mock<typeof webPush.sendNotification>(async () => sent);
+  const destination = new WebPushDestination(new Set(), sender);
+  await destination.subscribe(userId, subscription('mixed'));
+  expect(await listAttentionNotices([bad])).toEqual([]);
+  expect(await listAttentionNotices([valid])).toHaveLength(1);
+  const fresh = await pause('fresh');
+  await new AttentionRouter([destination], new Set()).scan();
+  expect(sender).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(String(sender.mock.calls[0]?.[1]))).toMatchObject({ runId: fresh });
+  expect(await listAttentionNotices([bad])).toEqual([]);
+  expect(await stored()).toEqual(before);
 });
