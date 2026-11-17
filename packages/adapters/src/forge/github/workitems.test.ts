@@ -7,6 +7,7 @@ import {
 } from '@archon/forge/operations';
 import type { Fetch } from './api';
 import { githubPluginMetadata, handleGithubOperation } from './operations';
+import { stampAutomated } from './comments';
 
 const repo = { host: 'github.com', path: 'owner/repo' };
 const ref = { repo, number: 1 };
@@ -629,7 +630,7 @@ test('an issue is commented on by its issue reference, and the marked comment is
     ok: true,
     result: { value: { changed: true } },
   });
-  expect(fake.comments.map(comment => comment.body)).toEqual([`${marker}\nsecond`]);
+  expect(fake.comments.map(comment => comment.body)).toEqual([stampAutomated(`${marker}\nsecond`)]);
   expect(fake.calls.filter(call => !call.startsWith('GET'))).toEqual([
     `POST ${root}/issues/1/comments`,
     `PATCH ${root}/issues/comments/900`,

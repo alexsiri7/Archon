@@ -8,6 +8,7 @@ import {
 import { githubPluginMetadata, handleGithubOperation } from './operations';
 import { json, pull, fakeGitHub, mergeGitHub, rerunGitHub, run } from './lifecycle-fixture';
 import { prRecord } from './pull-requests';
+import { AUTOMATED_MARKER, stampAutomated } from './comments';
 
 const repo = { host: 'github.com', path: 'archon/test' };
 const ref = { repo, number: 7 };
@@ -399,8 +400,18 @@ describe('the canonical comment is one comment across rounds', () => {
     });
     expect(github.comments).toEqual([
       { id: 1, body: 'an unrelated comment' },
-      { id: 900, body: round2 },
+      { id: 900, body: stampAutomated(round2) },
     ]);
+  });
+
+  test('every comment it writes carries the lachesis:automated stamp', async () => {
+    const github = fakeGitHub();
+    await run(
+      { operationId: 'stamp', op: 'comment.upsert', ref, marker, body: `${report}\n\n` },
+      github
+    );
+    expect(github.comments.at(-1)?.body).toBe(`${report}\n\n${AUTOMATED_MARKER}`);
+    expect(stampAutomated(`x\n\n${AUTOMATED_MARKER}`)).toBe(`x\n\n${AUTOMATED_MARKER}`);
   });
 
   test('a comment GitHub echoes in its registered repository case still verifies', async () => {
@@ -422,7 +433,7 @@ describe('the canonical comment is one comment across rounds', () => {
   });
 
   test('an unchanged round writes nothing and still verifies', async () => {
-    const github = fakeGitHub({ comments: [{ id: 5, body: report }] });
+    const github = fakeGitHub({ comments: [{ id: 5, body: stampAutomated(report) }] });
     const response = await run(
       { operationId: 'again', op: 'comment.upsert', ref, marker, body: report },
       github

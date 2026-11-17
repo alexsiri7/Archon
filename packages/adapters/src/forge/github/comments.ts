@@ -26,12 +26,34 @@ const commentSchema = z.object({
 });
 type Comment = z.infer<typeof commentSchema>;
 
-function commentRecord(ref: PrRef, comment: Comment): ForgeCommentRecord {
+/**
+ * The line the owner's factory `gh` wrapper (interstellarai.net
+ * ops/host/archon-user/gh-shim/gh) appends to every comment an archon session
+ * posts, so Lachesis never takes an agent's comment for the author's answer.
+ * This adapter talks to the API directly, past the wrapper, so it stamps the
+ * same line itself, the same way: trailing whitespace trimmed, then a blank
+ * line and the marker, unless the body already ends with it.
+ */
+export const AUTOMATED_MARKER = '<!-- lachesis:automated -->';
+
+export function stampAutomated(body: string): string {
+  const trimmed = body.replace(/\s+$/u, '');
+  return trimmed.endsWith(AUTOMATED_MARKER) ? trimmed : `${trimmed}\n\n${AUTOMATED_MARKER}`;
+}
+
+/**
+ * `asWritten` is the body as requested: a stored body that is exactly that body
+ * with the automated stamp is reported as the requested body, so the stamp stays
+ * invisible to callers and to the read-back evidence.
+ */
+function commentRecord(ref: PrRef, comment: Comment, asWritten?: string): ForgeCommentRecord {
+  const stored = comment.body ?? '';
+  const body = asWritten !== undefined && stored === stampAutomated(asWritten) ? asWritten : stored;
   return {
     ref,
     id: String(comment.id),
     url: comment.html_url,
-    bodyDigest: contentDigest(comment.body ?? ''),
+    bodyDigest: contentDigest(body),
   };
 }
 
@@ -71,12 +93,13 @@ export async function upsertComment(
     });
   }
   const previous = marked[0];
-  if (previous && (previous.body ?? '') === request.body) {
+  const body = stampAutomated(request.body);
+  if (previous && (previous.body ?? '') === body) {
     // The listing is the read-back: the canonical comment already carries this body.
     return applied(request, {
       changed: false,
       ...subject,
-      comment: commentRecord(ref, previous),
+      comment: commentRecord(ref, previous, request.body),
     });
   }
   submit('submitted');
@@ -84,7 +107,7 @@ export async function upsertComment(
     fetchImpl,
     token,
     previous ? `${root}/repos/${path}/issues/comments/${String(previous.id)}` : `${issue}/comments`,
-    { method: previous ? 'PATCH' : 'POST', body: JSON.stringify({ body: request.body }) },
+    { method: previous ? 'PATCH' : 'POST', body: JSON.stringify({ body }) },
     () => {
       submit('acknowledged');
     }
@@ -113,12 +136,12 @@ export async function upsertComment(
   } catch {
     return unverified(request, 'Comment could not be read back', leaveBehind, subject);
   }
-  const comment = commentRecord(ref, observed);
+  const comment = commentRecord(ref, observed, request.body);
   if (
     String(observed.id) !== String(written.id) ||
     // GitHub echoes owner/name in its registered case (see sameRepo).
     observed.issue_url.toLowerCase() !== issue.toLowerCase() ||
-    (observed.body ?? '') !== request.body
+    (observed.body ?? '') !== body
   ) {
     return unverified(request, 'Comment read-back did not match', leaveBehind, {
       ...subject,
