@@ -344,6 +344,28 @@ export function ghIssueComments(ref: QualifiedPr): GhComment[] {
   }
 }
 
+/**
+ * The line the owner's factory `gh` wrapper (interstellarai.net
+ * ops/host/archon-user/gh-shim/gh) appends to every comment an archon session
+ * posts, so Lachesis never takes an agent's comment for the author's answer.
+ */
+const AUTOMATED_MARKER = '<!-- lachesis:automated -->';
+
+/**
+ * Whether a comment read back from GitHub carries exactly the body that was
+ * written. The wrapper strips trailing whitespace and appends a blank line and
+ * AUTOMATED_MARKER unless the body already ends with it; that stamp, and only
+ * that stamp, still counts as the body as written.
+ */
+export function readsBackAs(observed: string | undefined, written: string): boolean {
+  if (observed === undefined) return false;
+  if (observed === written) return true;
+  const trimmed = written.replace(/\s+$/u, '');
+  if (trimmed === '') return false;
+  const stamped = trimmed.endsWith(AUTOMATED_MARKER) ? trimmed : `${trimmed}\n\n${AUTOMATED_MARKER}`;
+  return observed === stamped;
+}
+
 /** An issue or a pull request, as a comment addresses it. */
 export interface CommentSubject {
   readonly kind: 'issue' | 'pr';
@@ -384,7 +406,7 @@ export function upsertComment(
     throw new Error('more than one comment on this item carries the canonical marker');
   }
   const previous = marked[0];
-  if (previous?.body === body) return { url: previous.url };
+  if (previous !== undefined && readsBackAs(previous.body, body)) return { url: previous.url };
   // gh reads the body from a JSON request file: `-f body=@path` would post the
   // literal string, and argv is not where authored content belongs.
   const directory = mkdtempSync(join(tmpdir(), 'archon-comment-'));
@@ -413,7 +435,7 @@ export function upsertComment(
     throw new Error('gh api returned no comment identity; a comment may have changed');
   }
   const observed = ghIssueComments(ref).find(comment => comment.id === String(id));
-  if (observed?.body !== body) {
+  if (observed === undefined || !readsBackAs(observed.body, body)) {
     throw new Error(
       `comment ${String(id)} does not read back as written; it may need reconciling`
     );

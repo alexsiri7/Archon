@@ -57,6 +57,8 @@ export interface GhFake {
   readonly writeFail?: string;
   /** Drop the write instead of applying it, so the read-back disagrees. */
   readonly writeLost?: boolean;
+  /** Store comment bodies as the owner's factory gh wrapper does: trimmed, then a blank line and the lachesis:automated marker. */
+  readonly stampComments?: boolean;
   /**
    * Existing tracker issues; `issue create` appends to them. `gh api` reads them
    * too, beside the one issue `issue` describes.
@@ -340,7 +342,8 @@ Object.defineProperty(Bun, 'spawnSync', { value: (argv, settings) => {
       return result(0, JSON.stringify(rows));
     }
     if (fake.writeFail !== undefined) return result(1, '', fake.writeFail);
-    const body = input().body;
+    const sent = input().body;
+    const body = fake.stampComments && !sent.trimEnd().endsWith('<!-- lachesis:automated -->') ? sent.trimEnd() + '\\n\\n<!-- lachesis:automated -->' : sent;
     const id = method === 'PATCH' ? Number(endpoint.split('/').pop()) : nextId++;
     let row = comments.find(entry => entry.id === id);
     if (!fake.writeLost) {

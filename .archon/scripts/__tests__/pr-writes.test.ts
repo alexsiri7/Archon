@@ -577,6 +577,28 @@ describe('publish-review keeps one canonical comment per pull request', () => {
     expect(result.stderr).toContain('does not read back as written');
   });
 
+  // The owner's factory gh wrapper appends a blank line and the
+  // lachesis:automated marker to every comment a session posts; that stamp is
+  // still the comment as written (interstellarai.net#313).
+  it('accepts a comment the factory gh wrapper stamped with the automated marker', () => {
+    const result = publishReview({ inputs: report, gh: { stampComments: true } });
+    expect(result.code).toBe(0);
+    expect(result.gh.some(call => call.includes('--method POST'))).toBe(true);
+  });
+
+  it('leaves a stamped comment alone when its body has not changed', () => {
+    const first = publishReview({ inputs: report, gh: { stampComments: true } });
+    expect(first.code).toBe(0);
+    const posted = first.comments.at(-1)?.body ?? '';
+    expect(posted.endsWith('\n\n<!-- lachesis:automated -->')).toBe(true);
+    const second = publishReview({
+      inputs: report,
+      gh: { stampComments: true, comments: [{ id: 5, body: posted }] },
+    });
+    expect(second.code).toBe(0);
+    expect(second.gh.some(call => call.includes('--method'))).toBe(false);
+  });
+
   it('publishes nothing for a working-diff review and still reports the verdict', () => {
     const result = publishReview({ inputs: { ...report, INPUTS_PR: 'null' } });
     expect(result.code).toBe(0);
