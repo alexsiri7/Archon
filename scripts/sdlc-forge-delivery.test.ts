@@ -22,6 +22,7 @@ import {
   type ScriptRun,
 } from '../.archon/scripts/__tests__/deliver-checks-harness';
 import { FAKE_HOST, initialState, type FakeGitHubState } from './fixtures/sdlc-fake-github';
+import { stampAutomated } from '../packages/adapters/src/forge/github/comments';
 import { providerRegistry } from '@archon/providers';
 import { discoverWorkflows } from '../packages/workflows/src/workflow-discovery';
 import { dryRunWorkflow } from '../packages/workflows/src/dry-run';
@@ -209,7 +210,9 @@ describe('delivery goes through plugin operations', () => {
     expect(state.comments).toEqual([
       {
         id: 900,
-        body: `${MARKER}\nReviewed commit: \`${HEAD_SHA}\`\nVerdict: ready\nContract: complete\n\n${ROUND_TWO}`,
+        body: stampAutomated(
+          `${MARKER}\nReviewed commit: \`${HEAD_SHA}\`\nVerdict: ready\nContract: complete\n\n${ROUND_TWO}`
+        ),
       },
     ]);
     const writes = state.calls.filter(call => !call.startsWith('GET '));
@@ -484,7 +487,7 @@ it('closes a resolved item through the plugin, linking it to what resolved it an
     }),
   ];
   expect(state.comments.map(row => ({ number: row.issue, body: row.body }))).toEqual(
-    expected.map(comment => ({ number: comment.item.number, body: comment.body }))
+    expected.map(comment => ({ number: comment.item.number, body: stampAutomated(comment.body) }))
   );
   expect(
     state.calls.filter(call => call.startsWith('POST ') && call.endsWith('/comments'))
